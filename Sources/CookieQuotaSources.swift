@@ -1,0 +1,231 @@
+import Foundation
+import Security
+
+struct CookieQuotaSource: Codable, Identifiable, Hashable {
+    var id: String
+    var provider: String
+    var connectionID: String
+    var accountName: String
+    var endpoint: String
+    var windowKey: String
+    var remainingField: String
+    var resetField: String
+    var durationField: String
+    var valueIsUsedPercentage: Bool
+    var updatedAt: Date
+}
+
+enum CookieQuotaError: LocalizedError {
+    case badEndpoint
+    case emptyCookie
+    case httpStatus(Int)
+    case invalidJSON
+    case missingField(String)
+    case invalidNumber(String)
+    case keychain(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .badEndpoint: "Enter an HTTPS usage endpoint (HTTP is allowed only for localhost)."
+        case .emptyCookie: "Paste the website cookie for this account."
+        case .httpStatus(let code): "The usage endpoint returned HTTP \(code). Check the endpoint and cookie."
+        case .invalidJSON: "The endpoint did not return a JSON object."
+        case .missingField(let path): "The response did not contain the configured field ‘\(path)’."
+        case .invalidNumber(let path): "The field ‘\(path)’ is not a number."
+        case .keychain(let reason): "Couldn't store the cookie in Keychain: \(reason)"
+        }
+    }
+}
+
+final class CookieQuotaSourceStore {
+    private let defaultsKey = "cookieQuotaSources"
+    private let service = "com.reecedove.tdzstatus.provider-cookie"
+
+    func sources() -> [CookieQuotaSource] {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let sources = try? JSONDecoder().decode([CookieQuotaSource].self, from: data) else { return [] }
+        return sources
+    }
+
+    func save(_ source: CookieQuotaSource, cookie: String) throws {
+        let cleaned = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { throw CookieQuotaError.emptyCookie }
+        let account = source.id as CFString
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let update: [String: Any] = [kSecValueData as String: Data(cleaned.utf8)]
+        let status = SecItemUpdate(base as CFDictionary, update as CFDictionary)
+        if status == errSecItemNotFound {
+            var item = base
+            item[kSecValueData as String] = Data(cleaned.utf8)
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            let addStatus = SecItemAdd(item as CFDictionary, nil)
+            guard addStatus == errSecSuccess else { throw CookieQuotaError.keychain(SecCopyErrorMessageString(addStatus, nil) as String? ?? "Keychain error \(addStatus)") }
+        } else if status != errSecSuccess {
+            throw CookieQuotaError.keychain(SecCopyErrorMessageString(status, nil) as String? ?? "Keychain error \(status)")
+        }
+
+        var current = sources().filter { $0.id != source.id }
+        current.append(source)
+        current.sort { $0.provider.localizedCaseInsensitiveCompare($1.provider) == .orderedAscending }
+        let data = try JSONEncoder().encode(current)
+        UserDefaults.standard.set(data, forKey: defaultsKey)
+    }
+
+    func cookie(for sourceID: String) throws -> String {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: sourceID,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data,
+              let value = String(data: data, encoding: .utf8) else {
+            throw CookieQuotaError.keychain(SecCopyErrorMessageString(status, nil) as String? ?? "Keychain item is unavailable")
+        }
+        return value
+    }
+
+    func remove(_ sourceID: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: sourceID,
+        ]
+        SecItemDelete(query as CFDictionary)
+        let current = sources().filter { $0.id != sourceID }
+        if let data = try? JSONEncoder().encode(current) {
+            UserDefaults.standard.set(data, forKey: defaultsKey)
+        }
+    }
+}
+
+final class CookieQuotaFetcher {
+    private lazy var session = URLSession(
+        configuration: .ephemeral,
+        delegate: SameOriginCookieRedirectDelegate(),
+        delegateQueue: nil
+    )
+
+    func fetch(source: CookieQuotaSource, cookie: String, completion: @escaping (Result<QuotaWindow, Error>) -> Void) {
+        guard let url = URL(string: source.endpoint), validEndpoint(url) else {
+            completion(.failure(CookieQuotaError.badEndpoint))
+            return
+        }
+        let cleaned = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else {
+            completion(.failure(CookieQuotaError.emptyCookie))
+            return
+        }
+
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 18)
+        request.httpMethod = "GET"
+        request.setValue(cleaned, forHTTPHeaderField: "Cookie")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("TDZStatus/0.1.0", forHTTPHeaderField: "User-Agent")
+
+        session.dataTask(with: request) { data, response, error in
+            if let error {
+                completion(.failure(error))
+                return
+            }
+            guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) else {
+                let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                completion(.failure(CookieQuotaError.httpStatus(code)))
+                return
+            }
+            guard let data,
+                  let object = try? JSONSerialization.jsonObject(with: data) else {
+                completion(.failure(CookieQuotaError.invalidJSON))
+                return
+            }
+            do {
+                let value = try self.number(at: source.remainingField, in: object)
+                let remaining = source.valueIsUsedPercentage ? 100 - value : value
+                let resetValue = self.value(at: source.resetField, in: object)
+                let resetDate = self.date(from: resetValue)
+                let duration = source.durationField.isEmpty ? nil : try? self.number(at: source.durationField, in: object)
+                let window = QuotaWindow(
+                    provider: source.provider,
+                    connectionID: source.connectionID,
+                    accountName: source.accountName,
+                    key: source.windowKey,
+                    remainingPercentage: min(100, max(0, remaining)),
+                    isExhausted: remaining <= 0,
+                    resetsAt: resetDate,
+                    durationMilliseconds: duration.map { Int64($0 * 60_000) },
+                    capturedAt: Date()
+                )
+                completion(.success(window))
+            } catch {
+                completion(.failure(error))
+            }
+        }.resume()
+    }
+
+    private func validEndpoint(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else { return false }
+        return scheme == "https" || (scheme == "http" && ["localhost", "127.0.0.1", "::1"].contains(host))
+    }
+
+    private func value(at path: String, in root: Any) -> Any? {
+        let parts: [String]
+        if path.hasPrefix("/") {
+            parts = path.dropFirst().split(separator: "/").map {
+                String($0).replacingOccurrences(of: "~1", with: "/").replacingOccurrences(of: "~0", with: "~")
+            }
+        } else {
+            parts = path.split(separator: ".").map(String.init)
+        }
+        return parts.reduce(Optional(root)) { value, part in
+            guard let value else { return nil }
+            if let dictionary = value as? [String: Any] { return dictionary[part] }
+            if let array = value as? [Any], let index = Int(part), array.indices.contains(index) { return array[index] }
+            return nil
+        }
+    }
+
+    private func number(at path: String, in root: Any) throws -> Double {
+        guard let value = value(at: path, in: root) else { throw CookieQuotaError.missingField(path) }
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let string = value as? String, let number = Double(string) { return number }
+        throw CookieQuotaError.invalidNumber(path)
+    }
+
+    private func date(from value: Any?) -> Date? {
+        if let number = value as? NSNumber {
+            return Date(timeIntervalSince1970: number.doubleValue > 100_000_000_000 ? number.doubleValue / 1000 : number.doubleValue)
+        }
+        return parseQuotaDate(value as? String)
+    }
+}
+
+private final class SameOriginCookieRedirectDelegate: NSObject, URLSessionTaskDelegate {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        guard let original = task.originalRequest?.url,
+              let target = request.url,
+              original.scheme?.lowercased() == target.scheme?.lowercased(),
+              original.host?.caseInsensitiveCompare(target.host ?? "") == .orderedSame,
+              effectivePort(original) == effectivePort(target) else {
+            completionHandler(nil)
+            return
+        }
+        completionHandler(request)
+    }
+
+    private func effectivePort(_ url: URL) -> Int {
+        url.port ?? (url.scheme?.lowercased() == "https" ? 443 : 80)
+    }
+}
