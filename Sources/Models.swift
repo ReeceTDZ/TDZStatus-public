@@ -68,6 +68,7 @@ struct QuotaWindow: Identifiable, Hashable {
     var isExhausted: Bool
     var resetsAt: Date?
     var durationMilliseconds: Int64?
+    var resetIsEstimated = false
     var capturedAt: Date?
 
     var id: String { "\(provider)|\(connectionID)|\(key)" }
@@ -151,6 +152,10 @@ struct ProviderPool: Identifiable {
 
     func nextReset(for key: String) -> Date? {
         accounts(for: key).compactMap(\.resetsAt).min()
+    }
+
+    func resetIsEstimated(for key: String) -> Bool {
+        accounts(for: key).contains { $0.resetIsEstimated }
     }
 }
 
@@ -245,6 +250,8 @@ enum DashboardSection: String, CaseIterable, Identifiable {
 
 func displayProviderName(_ provider: String) -> String {
     let identifier = provider.lowercased()
+    if identifier == "codecraft" { return "CodeCraft API" }
+    if identifier == "tokenharbor" { return "Token Harbor" }
     if identifier.hasPrefix("anthropic-compatible") { return "Anthropic Compatible" }
     if identifier.hasPrefix("openai-compatible-chat") { return "OpenAI Compatible" }
     switch identifier {
@@ -263,6 +270,14 @@ func displayProviderName(_ provider: String) -> String {
         guard let first = part.first else { return String(part) }
         return String(first).uppercased() + part.dropFirst()
     }.joined(separator: " ")
+}
+
+func isCodeCraftProvider(_ provider: String?) -> Bool {
+    provider?.caseInsensitiveCompare("codecraft") == .orderedSame
+}
+
+func isTokenHarborProvider(_ provider: String?) -> Bool {
+    provider?.caseInsensitiveCompare("tokenharbor") == .orderedSame
 }
 
 func parseQuotaDate(_ value: String?) -> Date? {

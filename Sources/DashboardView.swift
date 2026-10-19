@@ -5,6 +5,7 @@ struct DashboardView: View {
     @ObservedObject var model: TDZStatusModel
     @State private var expandedProvider: String?
     @State private var showCookieEditor = false
+    @State private var showOmniRouteRefreshEditor = false
     @State private var selectedCookieAccountID: String?
 
     var body: some View {
@@ -32,6 +33,9 @@ struct DashboardView: View {
         .sheet(isPresented: $showCookieEditor, onDismiss: { selectedCookieAccountID = nil }) {
             CookieSourceEditor(model: model, initialAccountID: selectedCookieAccountID)
                 .frame(width: 520, height: 590)
+        }
+        .sheet(isPresented: $showOmniRouteRefreshEditor) {
+            OmniRouteRefreshEditor(model: model)
         }
     }
 
@@ -61,14 +65,15 @@ struct DashboardView: View {
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.secondary)
             }
-            Button { model.refreshAll() } label: {
-                Image(systemName: "arrow.clockwise")
+            Button { model.refreshUsageNow() } label: {
+                Image(systemName: model.isRefreshingUsage ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
                     .font(.system(size: 13, weight: .semibold))
                     .frame(width: 29, height: 29)
                     .background(.quaternary, in: Circle())
             }
             .buttonStyle(.plain)
-            .help("Refresh usage and harness status")
+            .disabled(model.isRefreshingUsage)
+            .help("Refresh linked dashboards and ask OmniRoute for fresh provider limits")
         }
         .padding(.horizontal, 18)
         .padding(.top, 16)
@@ -202,7 +207,7 @@ struct DashboardView: View {
                 } else {
                     LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                         ForEach(model.providerPools.prefix(4)) { pool in
-                            ProviderPoolCard(pool: pool, expandedProvider: $expandedProvider, splitAccounts: model.splitAccounts, configureCookie: configureCookie)
+                            ProviderPoolCard(pool: pool, expandedProvider: $expandedProvider, splitAccounts: model.splitAccounts, isRefreshing: model.isRefreshingUsage, configureCookie: configureCookie, refreshUsage: { provider, connectionID in model.refreshProviderUsage(provider, connectionID: connectionID) })
                         }
                     }
                 }
@@ -255,7 +260,7 @@ struct DashboardView: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text("Provider usage")
                     .font(.system(size: 20, weight: .bold, design: .rounded))
-                Text("Providers with several accounts show an average remaining percentage. A provider with one account is shown directly, and resets include the exact timestamp.")
+                Text("Combined pools show the average remaining percentage. Use refresh to pull linked dashboards and request fresh OmniRoute snapshots; split view shows every configured account.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -274,7 +279,7 @@ struct DashboardView: View {
             } else {
                 VStack(spacing: 10) {
                     ForEach(model.providerPools) { pool in
-                        ProviderPoolCard(pool: pool, expandedProvider: $expandedProvider, splitAccounts: model.splitAccounts, fullWidth: true, configureCookie: configureCookie)
+                        ProviderPoolCard(pool: pool, expandedProvider: $expandedProvider, splitAccounts: model.splitAccounts, fullWidth: true, isRefreshing: model.isRefreshingUsage, configureCookie: configureCookie, refreshUsage: { provider, connectionID in model.refreshProviderUsage(provider, connectionID: connectionID) })
                     }
                 }
             }
@@ -339,10 +344,21 @@ struct DashboardView: View {
                         .foregroundStyle(.tertiary)
                         .textSelection(.enabled)
                     HStack {
-                        Button("Reconnect") { model.refreshOmniRoute() }
+                        Button("Refresh usage") { model.refreshUsageNow() }
                             .buttonStyle(.bordered)
                         Button("Refresh Codex limits") { model.refreshCodexUsage() }
                             .buttonStyle(.bordered)
+                    }
+                    HStack(spacing: 8) {
+                        Button(model.hasOmniRouteRefreshSession ? "Update dashboard refresh…" : "Connect dashboard refresh…") {
+                            showOmniRouteRefreshEditor = true
+                        }
+                        .buttonStyle(.bordered)
+                        Text(model.hasOmniRouteRefreshSession
+                            ? "On-demand provider refresh connected"
+                            : "Needed to tell OmniRoute to fetch provider data now")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -373,7 +389,7 @@ struct DashboardView: View {
 
             SettingsCard(title: "Provider dashboard cookies", symbol: "key.horizontal") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Use this when OmniRoute does not publish an account quota. xKiro has a ready-to-use dashboard preset; custom endpoints support percentage or used-and-limit values.")
+                    Text("Use this when OmniRoute does not publish an account quota. xKiro, CodeCraft API, and Token Harbor have ready-to-use presets; custom JSON endpoints support percentage or used-and-limit values.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -543,7 +559,9 @@ private struct ProviderPoolCard: View {
     @Binding var expandedProvider: String?
     var splitAccounts: Bool
     var fullWidth = false
+    var isRefreshing = false
     var configureCookie: (ProviderAccount) -> Void
+    var refreshUsage: (String, String?) -> Void
 
     private var isExpanded: Bool {
         !pool.isSingleAccount && expandedProvider == pool.id
@@ -571,10 +589,10 @@ private struct ProviderPoolCard: View {
             header
 
             if pool.isCodex {
-                if fullWidth {
+                if splitAccounts || isExpanded {
                     accountBreakdown
                 } else {
-                    codexAccountSummary
+                    usageSummary
                 }
             } else if pool.isNVIDIA {
                 noMeasuredQuota
@@ -595,31 +613,44 @@ private struct ProviderPoolCard: View {
     }
 
     private var header: some View {
-        Button {
-            guard !pool.isSingleAccount else { return }
-            expandedProvider = isExpanded ? nil : pool.id
-        } label: {
-            HStack(alignment: .center, spacing: 9) {
-                ProviderGlyph(provider: pool.provider)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(displayProviderName(pool.provider))
-                        .font(.system(size: 12, weight: .bold))
-                        .foregroundStyle(.primary)
-                    Text(summaryDetail)
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(.secondary)
+        HStack(alignment: .center, spacing: 9) {
+            Button {
+                guard !pool.isSingleAccount else { return }
+                expandedProvider = isExpanded ? nil : pool.id
+            } label: {
+                HStack(alignment: .center, spacing: 9) {
+                    ProviderGlyph(provider: pool.provider)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(displayProviderName(pool.provider))
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(.primary)
+                        Text(summaryDetail)
+                            .font(.system(size: 9, weight: .medium))
+                            .foregroundStyle(.secondary)
+                    }
+                    if !pool.isSingleAccount {
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(.tertiary)
+                    }
                 }
-                Spacer(minLength: 0)
-                if !pool.isSingleAccount {
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(.tertiary)
-                }
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+            .disabled(pool.isSingleAccount)
+            Spacer(minLength: 0)
+            Button {
+                refreshUsage(pool.provider, nil)
+            } label: {
+                Image(systemName: isRefreshing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 24, height: 24)
+                    .background(.quaternary, in: Circle())
+            }
+            .buttonStyle(.plain)
+            .disabled(isRefreshing)
+            .help("Refresh \(displayProviderName(pool.provider)) usage")
         }
-        .buttonStyle(.plain)
-        .disabled(pool.isSingleAccount)
     }
 
     private var noMeasuredQuota: some View {
@@ -662,6 +693,9 @@ private struct ProviderPoolCard: View {
 
     private var usageSummary: some View {
         VStack(alignment: .leading, spacing: 9) {
+            if pool.isCodex {
+                codexAccountSummary
+            }
             if pool.isAntigravity {
                 Label("Two shared weekly pools: Gemini and all other models.", systemImage: "link")
                     .font(.system(size: 9, weight: .medium))
@@ -671,7 +705,8 @@ private struct ProviderPoolCard: View {
                 UsageSummaryLine(
                     title: displayQuotaWindowName(key, provider: pool.provider),
                     remaining: pool.averageRemaining(for: key),
-                    reset: pool.nextReset(for: key)
+                    reset: pool.nextReset(for: key),
+                    resetIsEstimated: pool.resetIsEstimated(for: key)
                 )
             }
             if hasHiddenGitHubLimits {
@@ -722,6 +757,15 @@ private struct ProviderPoolCard: View {
                 Text(!account.isActive ? "Disabled" : accountWindows.isEmpty ? "Needs dashboard" : "Reporting")
                     .font(.system(size: 8, weight: .semibold))
                     .foregroundStyle(!account.isActive ? Color.orange : accountWindows.isEmpty ? Color.secondary : Color.green)
+                Button {
+                    refreshUsage(account.provider, account.connectionID)
+                } label: {
+                    Image(systemName: isRefreshing ? "arrow.triangle.2.circlepath" : "arrow.clockwise")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                .buttonStyle(.plain)
+                .disabled(isRefreshing)
+                .help("Refresh \(account.displayName) usage")
             }
             if accountWindows.isEmpty {
                 Text("No trackable quota was recorded for this account.")
@@ -750,6 +794,7 @@ private struct UsageSummaryLine: View {
     let title: String
     let remaining: Double?
     let reset: Date?
+    var resetIsEstimated = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -766,7 +811,7 @@ private struct UsageSummaryLine: View {
             }
             UsageProgress(remaining: remaining)
             if let reset {
-                Text(resetCaption(reset))
+                Text(resetCaption(reset, estimated: resetIsEstimated))
                     .font(.system(size: 8, weight: .medium))
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
@@ -793,7 +838,7 @@ private struct UsageWindowLine: View {
             }
             UsageProgress(remaining: window.remainingPercentage)
             if let reset = window.resetsAt {
-                Text(resetCaption(reset))
+                Text(resetCaption(reset, estimated: window.resetIsEstimated))
                     .font(.system(size: 8, weight: .medium))
                     .foregroundStyle(window.isExhausted ? Color.red : Color.secondary.opacity(0.65))
                     .lineLimit(1)
@@ -806,8 +851,8 @@ private struct UsageWindowLine: View {
     }
 }
 
-private func resetCaption(_ reset: Date) -> String {
-    "Resets \(reset.formatted(.relative(presentation: .named))) · \(reset.formatted(date: .abbreviated, time: .shortened))"
+private func resetCaption(_ reset: Date, estimated: Bool = false) -> String {
+    "\(estimated ? "Estimated " : "")resets \(reset.formatted(.relative(presentation: .named))) · \(reset.formatted(date: .abbreviated, time: .shortened))"
 }
 
 private struct UsageProgress: View {

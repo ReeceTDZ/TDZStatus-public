@@ -3,6 +3,8 @@ import SwiftUI
 private enum CookieQuotaPreset: String, CaseIterable, Identifiable {
     case custom
     case xkiro
+    case codeCraft
+    case tokenHarbor
 
     var id: String { rawValue }
 
@@ -10,11 +12,16 @@ private enum CookieQuotaPreset: String, CaseIterable, Identifiable {
         switch self {
         case .custom: "Custom endpoint"
         case .xkiro: "xKiro · Free models daily allowance"
+        case .codeCraft: "CodeCraft API · Monthly plan allowance"
+        case .tokenHarbor: "Token Harbor · Free allowance"
         }
     }
 
     static func suggested(for provider: String?) -> CookieQuotaPreset {
-        provider?.caseInsensitiveCompare("xkiro") == .orderedSame ? .xkiro : .custom
+        if provider?.caseInsensitiveCompare("xkiro") == .orderedSame { return .xkiro }
+        if isCodeCraftProvider(provider) { return .codeCraft }
+        if isTokenHarborProvider(provider) { return .tokenHarbor }
+        return .custom
     }
 
     var configuration: (
@@ -24,7 +31,8 @@ private enum CookieQuotaPreset: String, CaseIterable, Identifiable {
         limitField: String,
         resetField: String,
         durationField: String,
-        valueMode: CookieQuotaValueMode
+        valueMode: CookieQuotaValueMode,
+        responseFormat: CookieQuotaResponseFormat
     )? {
         switch self {
         case .custom: nil
@@ -36,7 +44,30 @@ private enum CookieQuotaPreset: String, CaseIterable, Identifiable {
                 limitField: "data.freeQuota.cap",
                 resetField: "data.freeQuota.resetAt",
                 durationField: "",
-                valueMode: .usedOfLimit
+                valueMode: .usedOfLimit,
+                responseFormat: .json
+            )
+        case .codeCraft:
+            (
+                endpoint: "https://codecraftapi.com/dashboard/billing/plan",
+                windowKey: "Monthly plan allowance",
+                valueField: "",
+                limitField: "",
+                resetField: "",
+                durationField: "",
+                valueMode: .remainingPercentage,
+                responseFormat: .codeCraftPlanHTML
+            )
+        case .tokenHarbor:
+            (
+                endpoint: "https://tokenharbor.ai/api/me/free-tier",
+                windowKey: "Free allowance",
+                valueField: "used_pct",
+                limitField: "",
+                resetField: "reset_at",
+                durationField: "",
+                valueMode: .usedPercentage,
+                responseFormat: .json
             )
         }
     }
@@ -57,6 +88,7 @@ struct CookieSourceEditor: View {
     @State private var resetField: String
     @State private var durationField: String
     @State private var valueMode: CookieQuotaValueMode
+    @State private var responseFormat: CookieQuotaResponseFormat
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -76,6 +108,7 @@ struct CookieSourceEditor: View {
         _resetField = State(initialValue: configuration?.resetField ?? "data.usage.resets_at")
         _durationField = State(initialValue: configuration?.durationField ?? "")
         _valueMode = State(initialValue: configuration?.valueMode ?? .remainingPercentage)
+        _responseFormat = State(initialValue: configuration?.responseFormat ?? .json)
     }
 
     private var selectedAccount: ProviderAccount? {
@@ -127,18 +160,30 @@ struct CookieSourceEditor: View {
                     }
                     TextField("HTTPS endpoint", text: $endpoint, prompt: Text("https://provider.example/api/usage"))
                     TextField("Window label", text: $windowKey)
-                    Picker("Response value", selection: $valueMode) {
-                        ForEach(CookieQuotaValueMode.allCases) { mode in
-                            Text(mode.title).tag(mode)
+                    Picker("Response format", selection: $responseFormat) {
+                        ForEach(CookieQuotaResponseFormat.allCases) { format in
+                            Text(format.title).tag(format)
                         }
                     }
-                    TextField(usesAmountLimit ? "Used amount field" : "Percentage field", text: $valueField)
-                    if usesAmountLimit {
-                        TextField("Limit field", text: $limitField)
+                    if responseFormat == .json {
+                        Picker("Response value", selection: $valueMode) {
+                            ForEach(CookieQuotaValueMode.allCases) { mode in
+                                Text(mode.title).tag(mode)
+                            }
+                        }
+                        TextField(usesAmountLimit ? "Used amount field" : "Percentage field", text: $valueField)
+                        if usesAmountLimit {
+                            TextField("Limit field", text: $limitField)
+                        }
+                        TextField("Reset timestamp field", text: $resetField, prompt: Text("data.usage.resets_at"))
+                        TextField("Window duration in minutes field", text: $durationField, prompt: Text("Optional"))
+                    } else {
+                        Text("CodeCraft’s authenticated plan page supplies its monthly allowance. TDZStatus estimates the reset as the next calendar month.")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    TextField("Reset timestamp field", text: $resetField, prompt: Text("data.usage.resets_at"))
-                    TextField("Window duration in minutes field", text: $durationField, prompt: Text("Optional"))
-                    Text("xKiro is prefilled from its dashboard endpoint. Custom sources can use dot paths or JSON Pointer paths. Reset values may be ISO dates or Unix timestamps.")
+                    Text("xKiro and Token Harbor use their dashboard JSON endpoints. Custom JSON sources support dot paths or JSON Pointer paths. Reset values may be ISO dates or Unix timestamps.")
                         .font(.system(size: 9))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -215,6 +260,7 @@ struct CookieSourceEditor: View {
         resetField = configuration.resetField
         durationField = configuration.durationField
         valueMode = configuration.valueMode
+        responseFormat = configuration.responseFormat
     }
 
     private func testAndSave() {
@@ -234,6 +280,7 @@ struct CookieSourceEditor: View {
             valueIsUsedPercentage: valueMode == .usedPercentage,
             valueMode: valueMode,
             limitField: usesAmountLimit ? limitField.trimmingCharacters(in: .whitespacesAndNewlines) : nil,
+            responseFormat: responseFormat,
             updatedAt: Date()
         )
         model.testAndSaveCookieSource(source, cookie: cookie) { result in

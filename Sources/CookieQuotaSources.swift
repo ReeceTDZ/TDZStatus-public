@@ -17,6 +17,20 @@ enum CookieQuotaValueMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+enum CookieQuotaResponseFormat: String, Codable, CaseIterable, Identifiable {
+    case json
+    case codeCraftPlanHTML
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .json: "JSON endpoint"
+        case .codeCraftPlanHTML: "CodeCraft plan page"
+        }
+    }
+}
+
 struct CookieQuotaSource: Codable, Identifiable, Hashable {
     var id: String
     var provider: String
@@ -32,11 +46,15 @@ struct CookieQuotaSource: Codable, Identifiable, Hashable {
     /// earlier releases, which only supported percentage-valued responses.
     var valueMode: CookieQuotaValueMode? = nil
     var limitField: String? = nil
+    /// Nil means JSON so cookie sources saved by earlier releases keep working.
+    var responseFormat: CookieQuotaResponseFormat? = nil
     var updatedAt: Date
 
     var effectiveValueMode: CookieQuotaValueMode {
         valueMode ?? (valueIsUsedPercentage ? .usedPercentage : .remainingPercentage)
     }
+
+    var effectiveResponseFormat: CookieQuotaResponseFormat { responseFormat ?? .json }
 }
 
 enum CookieQuotaError: LocalizedError {
@@ -157,7 +175,7 @@ final class CookieQuotaFetcher {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 18)
         request.httpMethod = "GET"
         request.setValue(cleaned, forHTTPHeaderField: "Cookie")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue(source.effectiveResponseFormat == .json ? "application/json" : "text/html,application/xhtml+xml", forHTTPHeaderField: "Accept")
         request.setValue("TDZStatus/0.1.0", forHTTPHeaderField: "User-Agent")
 
         session.dataTask(with: request) { data, response, error in
@@ -170,40 +188,19 @@ final class CookieQuotaFetcher {
                 completion(.failure(CookieQuotaError.httpStatus(code)))
                 return
             }
-            guard let data,
-                  let object = try? JSONSerialization.jsonObject(with: data) else {
-                completion(.failure(CookieQuotaError.invalidJSON))
-                return
-            }
             do {
-                let value = try self.number(at: source.remainingField, in: object)
-                let remaining: Double
-                switch source.effectiveValueMode {
-                case .remainingPercentage:
-                    remaining = value
-                case .usedPercentage:
-                    remaining = 100 - value
-                case .usedOfLimit:
-                    guard let limitPath = source.limitField?.trimmingCharacters(in: .whitespacesAndNewlines),
-                          !limitPath.isEmpty else {
-                        throw CookieQuotaError.missingField("usage limit")
-                    }
-                    let limit = try self.number(at: limitPath, in: object)
-                    guard limit > 0 else { throw CookieQuotaError.invalidNumber(limitPath) }
-                    remaining = 100 * (limit - value) / limit
-                }
-                let resetValue = self.value(at: source.resetField, in: object)
-                let resetDate = self.date(from: resetValue)
-                let duration = source.durationField.isEmpty ? nil : try? self.number(at: source.durationField, in: object)
+                guard let data else { throw CookieQuotaError.invalidJSON }
+                let result = try self.parseQuota(data: data, source: source)
                 let window = QuotaWindow(
                     provider: source.provider,
                     connectionID: source.connectionID,
                     accountName: source.accountName,
                     key: source.windowKey,
-                    remainingPercentage: min(100, max(0, remaining)),
-                    isExhausted: remaining <= 0,
-                    resetsAt: resetDate,
-                    durationMilliseconds: duration.map { Int64($0 * 60_000) },
+                    remainingPercentage: min(100, max(0, result.remaining)),
+                    isExhausted: result.remaining <= 0,
+                    resetsAt: result.resetDate,
+                    durationMilliseconds: result.duration.map { Int64($0 * 60_000) },
+                    resetIsEstimated: result.resetIsEstimated,
                     capturedAt: Date()
                 )
                 completion(.success(window))
@@ -211,6 +208,84 @@ final class CookieQuotaFetcher {
                 completion(.failure(error))
             }
         }.resume()
+    }
+
+    private struct ParsedQuota {
+        var remaining: Double
+        var resetDate: Date?
+        var duration: Double?
+        var resetIsEstimated: Bool
+    }
+
+    private func parseQuota(data: Data, source: CookieQuotaSource) throws -> ParsedQuota {
+        switch source.effectiveResponseFormat {
+        case .json:
+            guard let object = try? JSONSerialization.jsonObject(with: data) else {
+                throw CookieQuotaError.invalidJSON
+            }
+            let measuredValue = try number(at: source.remainingField, in: object)
+            let remaining: Double
+            switch source.effectiveValueMode {
+            case .remainingPercentage:
+                remaining = measuredValue
+            case .usedPercentage:
+                remaining = 100 - measuredValue
+            case .usedOfLimit:
+                guard let limitPath = source.limitField?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !limitPath.isEmpty else {
+                    throw CookieQuotaError.missingField("usage limit")
+                }
+                let limit = try number(at: limitPath, in: object)
+                guard limit > 0 else { throw CookieQuotaError.invalidNumber(limitPath) }
+                remaining = 100 * (limit - measuredValue) / limit
+            }
+            let resetValue = value(at: source.resetField, in: object)
+            let resetDate = date(from: resetValue)
+            let duration = source.durationField.isEmpty ? nil : try? number(at: source.durationField, in: object)
+            return ParsedQuota(remaining: remaining, resetDate: resetDate, duration: duration, resetIsEstimated: false)
+
+        case .codeCraftPlanHTML:
+            return try parseCodeCraftPlan(data)
+        }
+    }
+
+    /// CodeCraft renders the account allowance in its authenticated plan HTML,
+    /// rather than an account-quota JSON endpoint. Its page explicitly says
+    /// "this month", so the reset shown here is clearly marked as an estimate
+    /// for the next calendar month.
+    private func parseCodeCraftPlan(_ data: Data) throws -> ParsedQuota {
+        guard let html = String(data: data, encoding: .utf8) else {
+            throw CookieQuotaError.invalidJSON
+        }
+        let text = html
+            .replacingOccurrences(of: "<script[\\s\\S]*?</script>", with: " ", options: .regularExpression)
+            .replacingOccurrences(of: "<style[\\s\\S]*?</style>", with: " ", options: .regularExpression)
+            .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+
+        let pattern = "tokens\\s+remaining\\s+([0-9][0-9,]*(?:\\.[0-9]+)?)\\s+of\\s+([0-9][0-9,]*(?:\\.[0-9]+)?)\\s+this\\s+month"
+        let range = NSRange(text.startIndex..., in: text)
+        guard let match = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]).firstMatch(in: text, range: range),
+              let remainingRange = Range(match.range(at: 1), in: text),
+              let limitRange = Range(match.range(at: 2), in: text),
+              let remaining = Double(text[remainingRange].replacingOccurrences(of: ",", with: "")),
+              let limit = Double(text[limitRange].replacingOccurrences(of: ",", with: "")),
+              limit > 0 else {
+            throw CookieQuotaError.missingField("CodeCraft monthly token allowance")
+        }
+        return ParsedQuota(
+            remaining: 100 * remaining / limit,
+            resetDate: nextCalendarMonth(),
+            duration: 31 * 24 * 60,
+            resetIsEstimated: true
+        )
+    }
+
+    private func nextCalendarMonth(now: Date = Date()) -> Date? {
+        let calendar = Calendar.current
+        guard let month = calendar.dateInterval(of: .month, for: now) else { return nil }
+        return calendar.date(byAdding: .month, value: 1, to: month.start)
     }
 
     /// Cookie-Editor exports a normal semicolon-separated Cookie header. For

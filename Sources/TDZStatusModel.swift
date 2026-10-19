@@ -35,6 +35,8 @@ final class TDZStatusModel: ObservableObject {
     @Published private(set) var isRefreshingCodexResetForecast = false
     @Published private(set) var lastRefreshAt: Date?
     @Published var refreshMessage: String?
+    @Published private(set) var isRefreshingUsage = false
+    @Published private(set) var hasOmniRouteRefreshSession = false
     @Published var showOnboarding: Bool
     @Published var iconPreference: IconPreference {
         didSet { UserDefaults.standard.set(iconPreference.rawValue, forKey: "iconPreference") }
@@ -63,6 +65,8 @@ final class TDZStatusModel: ObservableObject {
     private let codexResetForecastFetcher = CodexResetForecastFetcher()
     private let cookieSourceStore = CookieQuotaSourceStore()
     private let cookieQuotaFetcher = CookieQuotaFetcher()
+    private let omniRouteRefreshSessionStore = OmniRouteDashboardSessionStore()
+    private let omniRouteRefreshClient = OmniRouteRefreshClient()
     private var omniRouteAccounts: [ProviderAccount] = []
     private var cookieWindows: [String: QuotaWindow] = [:]
     private let zcodeStateDirectory = FileManager.default.homeDirectoryForCurrentUser
@@ -151,6 +155,7 @@ final class TDZStatusModel: ObservableObject {
         showCodexGlobalEstimate = defaults.object(forKey: "showCodexGlobalEstimate") as? Bool ?? true
         showOnboarding = !defaults.bool(forKey: "hasCompletedOnboarding")
         cookieSources = cookieSourceStore.sources()
+        hasOmniRouteRefreshSession = (try? omniRouteRefreshSessionStore.cookie()) != nil
         let databaseExists = FileManager.default.fileExists(atPath: OmniRouteReader.defaultDatabaseURL.path)
         omniRouteStatus = databaseExists ? .connected : .unavailable("OmniRoute was not found")
     }
@@ -198,6 +203,53 @@ final class TDZStatusModel: ObservableObject {
             refreshCodexUsage()
         }
         lastRefreshAt = Date()
+    }
+
+    /// Refreshes linked website quotas immediately, then asks OmniRoute's local
+    /// dashboard to fetch fresh provider quota snapshots when it is connected.
+    func refreshUsageNow() {
+        refreshAll()
+        refreshCookieSources()
+        requestOmniRouteQuotaRefresh()
+    }
+
+    func refreshProviderUsage(_ provider: String, connectionID: String? = nil) {
+        refreshHarnesses()
+        refreshOmniRoute()
+        refreshCookieSources(provider: provider, connectionID: connectionID)
+        requestOmniRouteQuotaRefresh()
+    }
+
+    func testAndSaveOmniRouteRefreshSession(cookie: String, completion: @escaping (Result<Void, Error>) -> Void) {
+        let normalized: String
+        do {
+            normalized = try OmniRouteDashboardSessionStore.normalizedCookieHeader(cookie)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+        omniRouteRefreshClient.validate(cookie: normalized) { [weak self] result in
+            Task { @MainActor in
+                guard let self else { return }
+                switch result {
+                case .success:
+                    do {
+                        try self.omniRouteRefreshSessionStore.save(cookie: normalized)
+                        self.hasOmniRouteRefreshSession = true
+                        completion(.success(()))
+                    } catch {
+                        completion(.failure(error))
+                    }
+                case .failure(let error):
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    func removeOmniRouteRefreshSession() {
+        omniRouteRefreshSessionStore.remove()
+        hasOmniRouteRefreshSession = false
     }
 
     private func refreshZCodeUsage() {
@@ -283,9 +335,11 @@ final class TDZStatusModel: ObservableObject {
         }
     }
 
-    func refreshCookieSources() {
+    func refreshCookieSources(provider: String? = nil, connectionID: String? = nil) {
         cookieSources = cookieSourceStore.sources()
-        for source in cookieSources where !cookieRequestsInProgress.contains(source.id) {
+        for source in cookieSources where !cookieRequestsInProgress.contains(source.id)
+            && (provider == nil || source.provider.caseInsensitiveCompare(provider!) == .orderedSame)
+            && (connectionID == nil || source.connectionID == connectionID!) {
             do {
                 let secret = try cookieSourceStore.cookie(for: source.id)
                 cookieRequestsInProgress.insert(source.id)
@@ -305,6 +359,34 @@ final class TDZStatusModel: ObservableObject {
                 }
             } catch {
                 cookieSourceErrors[source.id] = error.localizedDescription
+            }
+        }
+    }
+
+    private func requestOmniRouteQuotaRefresh() {
+        guard !isRefreshingUsage else { return }
+        guard let cookie = try? omniRouteRefreshSessionStore.cookie() else {
+            refreshMessage = "Website quotas refreshed. Connect the OmniRoute dashboard in Settings to request a fresh OmniRoute snapshot."
+            return
+        }
+        isRefreshingUsage = true
+        refreshMessage = "Requesting fresh provider limits from OmniRoute…"
+        omniRouteRefreshClient.refresh(cookie: cookie) { [weak self] result in
+            Task { @MainActor in
+                guard let self else { return }
+                self.isRefreshingUsage = false
+                switch result {
+                case .success:
+                    self.refreshMessage = "OmniRoute is updating provider limits…"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+                        guard let self else { return }
+                        self.refreshOmniRoute()
+                        self.refreshCookieSources()
+                        self.refreshMessage = "Fresh usage data loaded."
+                    }
+                case .failure(let error):
+                    self.refreshMessage = error.localizedDescription
+                }
             }
         }
     }
