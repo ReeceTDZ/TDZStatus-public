@@ -145,9 +145,9 @@ struct CookieSourceEditor: View {
                 }
 
                 Section("Website cookie") {
-                    SecureField("Cookie header", text: $cookie, prompt: Text("xt_at=…; xt_rt=…; xt_user=…"))
+                    SecureField("Cookie-Editor header", text: $cookie, prompt: Text("__xt_at=…; __xt_rt=…; __xt_user=…; xtrouter_theme=dark"))
                     if selectedAccount?.provider.caseInsensitiveCompare("xkiro") == .orderedSame {
-                        Text("For xKiro, include xt_at, xt_rt, and xt_user with their values. Leave _ga and xtrouter_theme out.")
+                        Text("Paste Cookie-Editor’s full semicolon-separated header. TDZStatus keeps xKiro’s __xt_at, __xt_rt, and __xt_user cookies and drops theme and analytics cookies.")
                             .font(.system(size: 9))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)

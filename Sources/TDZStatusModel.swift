@@ -314,13 +314,20 @@ final class TDZStatusModel: ObservableObject {
         cookie: String,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        cookieQuotaFetcher.fetch(source: source, cookie: cookie) { [weak self] result in
+        let cookieHeader: String
+        do {
+            cookieHeader = try CookieQuotaFetcher.normalizedCookieHeader(cookie, provider: source.provider)
+        } catch {
+            completion(.failure(error))
+            return
+        }
+        cookieQuotaFetcher.fetch(source: source, cookie: cookieHeader) { [weak self] result in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 switch result {
                 case .success(let window):
                     do {
-                        try self.cookieSourceStore.save(source, cookie: cookie)
+                        try self.cookieSourceStore.save(source, cookie: cookieHeader)
                         self.cookieSources = self.cookieSourceStore.sources()
                         self.cookieWindows[source.id] = window
                         self.cookieSourceErrors.removeValue(forKey: source.id)

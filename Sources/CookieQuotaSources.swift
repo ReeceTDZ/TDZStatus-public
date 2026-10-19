@@ -44,6 +44,8 @@ enum CookieQuotaError: LocalizedError {
     case emptyCookie
     case httpStatus(Int)
     case invalidJSON
+    case invalidCookieHeader
+    case missingXKiroCookies
     case missingField(String)
     case invalidNumber(String)
     case keychain(String)
@@ -54,6 +56,8 @@ enum CookieQuotaError: LocalizedError {
         case .emptyCookie: "Paste the website cookie for this account."
         case .httpStatus(let code): "The usage endpoint returned HTTP \(code). Check the endpoint and cookie."
         case .invalidJSON: "The endpoint did not return a JSON object."
+        case .invalidCookieHeader: "Paste a Cookie-Editor header in name=value; name=value format."
+        case .missingXKiroCookies: "The xKiro header must include __xt_at and __xt_rt cookies."
         case .missingField(let path): "The response did not contain the configured field ‘\(path)’."
         case .invalidNumber(let path): "The field ‘\(path)’ is not a number."
         case .keychain(let reason): "Couldn't store the cookie in Keychain: \(reason)"
@@ -142,9 +146,11 @@ final class CookieQuotaFetcher {
             completion(.failure(CookieQuotaError.badEndpoint))
             return
         }
-        let cleaned = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleaned.isEmpty else {
-            completion(.failure(CookieQuotaError.emptyCookie))
+        let cleaned: String
+        do {
+            cleaned = try Self.normalizedCookieHeader(cookie, provider: source.provider)
+        } catch {
+            completion(.failure(error))
             return
         }
 
@@ -205,6 +211,51 @@ final class CookieQuotaFetcher {
                 completion(.failure(error))
             }
         }.resume()
+    }
+
+    /// Cookie-Editor exports a normal semicolon-separated Cookie header. For
+    /// xKiro, retain only its auth/account cookies and ignore theme/analytics
+    /// values. Accept the older unprefixed cookie names as well.
+    static func normalizedCookieHeader(_ cookie: String, provider: String) throws -> String {
+        var header = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !header.isEmpty else { throw CookieQuotaError.emptyCookie }
+        if let colon = header.firstIndex(of: ":"),
+           header[..<colon].trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare("Cookie") == .orderedSame {
+            header = String(header[header.index(after: colon)...])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let pairs = header.split(separator: ";", omittingEmptySubsequences: true).compactMap { item -> (String, String)? in
+            let pieces = item.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard pieces.count == 2 else { return nil }
+            let name = pieces[0].trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = pieces[1].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, !value.isEmpty else { return nil }
+            return (name, value)
+        }
+        guard !pairs.isEmpty else { throw CookieQuotaError.invalidCookieHeader }
+
+        guard provider.caseInsensitiveCompare("xkiro") == .orderedSame else {
+            return pairs.map { "\($0.0)=\($0.1)" }.joined(separator: "; ")
+        }
+
+        let aliases = [
+            ["__xt_at", "xt_at"],
+            ["__xt_rt", "xt_rt"],
+            ["__xt_user", "xt_user"],
+        ]
+        var selected: [(String, String)] = []
+        for names in aliases {
+            if let pair = pairs.first(where: { names.contains($0.0) }) {
+                selected.append(pair)
+            }
+        }
+        guard selected.contains(where: { ["__xt_at", "xt_at"].contains($0.0) }),
+              selected.contains(where: { ["__xt_rt", "xt_rt"].contains($0.0) }) else {
+            throw CookieQuotaError.missingXKiroCookies
+        }
+        return selected.map { "\($0.0)=\($0.1)" }.joined(separator: "; ")
     }
 
     private func validEndpoint(_ url: URL) -> Bool {
