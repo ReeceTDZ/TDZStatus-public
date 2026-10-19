@@ -45,7 +45,7 @@ final class TDZStatusModel: ObservableObject {
     @Published var splitAccounts = false {
         didSet { UserDefaults.standard.set(splitAccounts, forKey: "splitAccounts") }
     }
-    @Published var showCodexGlobalEstimate = false {
+    @Published var showCodexGlobalEstimate = true {
         didSet {
             UserDefaults.standard.set(showCodexGlobalEstimate, forKey: "showCodexGlobalEstimate")
             if showCodexGlobalEstimate { refreshCodexResetForecast() }
@@ -148,7 +148,7 @@ final class TDZStatusModel: ObservableObject {
         iconPreference = IconPreference(rawValue: defaults.string(forKey: "iconPreference") ?? "automatic") ?? .automatic
         manualAnimationMode = ManualAnimationMode(rawValue: defaults.string(forKey: "manualAnimationMode") ?? "automatic") ?? .automatic
         splitAccounts = defaults.bool(forKey: "splitAccounts")
-        showCodexGlobalEstimate = defaults.bool(forKey: "showCodexGlobalEstimate")
+        showCodexGlobalEstimate = defaults.object(forKey: "showCodexGlobalEstimate") as? Bool ?? true
         showOnboarding = !defaults.bool(forKey: "hasCompletedOnboarding")
         cookieSources = cookieSourceStore.sources()
         let databaseExists = FileManager.default.fileExists(atPath: OmniRouteReader.defaultDatabaseURL.path)

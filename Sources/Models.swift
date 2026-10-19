@@ -100,6 +100,7 @@ struct ProviderPool: Identifiable {
     var isNVIDIA: Bool { provider.caseInsensitiveCompare("nvidia") == .orderedSame }
     var isAntigravity: Bool { provider.caseInsensitiveCompare("antigravity") == .orderedSame }
     var isGitHubCopilot: Bool { provider.caseInsensitiveCompare("github") == .orderedSame }
+    var isCodex: Bool { provider.caseInsensitiveCompare("codex") == .orderedSame }
 
     /// Some integrations publish individual model entries even though their
     /// consumption is charged against one shared window. Only show windows

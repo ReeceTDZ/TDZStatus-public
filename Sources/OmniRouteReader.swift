@@ -45,6 +45,8 @@ struct OmniRouteReader: Sendable {
         defer { sqlite3_close(database) }
 
         // This intentionally selects only public account labels and quota fields.
+        // Disabled Codex connections remain useful for account-by-account usage
+        // history, so include them while keeping other disabled providers out.
         // Credential columns (API keys, access/refresh tokens, cookies, ID tokens,
         // provider-specific data) are never read by TDZStatus.
         let sql = """
@@ -67,7 +69,7 @@ struct OmniRouteReader: Sendable {
         ) AS latest
             ON latest.provider = p.provider AND latest.connection_id = p.id
         LEFT JOIN quota_snapshots AS q ON q.id = latest.latest_id
-        WHERE COALESCE(p.is_active, 1) != 0
+        WHERE COALESCE(p.is_active, 1) != 0 OR lower(p.provider) = 'codex'
         ORDER BY p.provider COLLATE NOCASE, account_name COLLATE NOCASE, q.window_key COLLATE NOCASE
         """
 

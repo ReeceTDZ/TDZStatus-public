@@ -145,7 +145,13 @@ struct CookieSourceEditor: View {
                 }
 
                 Section("Website cookie") {
-                    SecureField("Paste the cookie header", text: $cookie)
+                    SecureField("Cookie header", text: $cookie, prompt: Text("xt_at=…; xt_rt=…; xt_user=…"))
+                    if selectedAccount?.provider.caseInsensitiveCompare("xkiro") == .orderedSame {
+                        Text("For xKiro, include xt_at, xt_rt, and xt_user with their values. Leave _ga and xtrouter_theme out.")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                     Text("The cookie is sent only to this provider endpoint and is stored in macOS Keychain after a successful test.")
                         .font(.system(size: 9))
                         .foregroundStyle(.secondary)

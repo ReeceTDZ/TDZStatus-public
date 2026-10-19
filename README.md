@@ -8,6 +8,7 @@ TDZStatus is a native macOS menu bar companion for ZCode, Claude, and ChatGPT Co
 - Preserves manual thinking, tool-running, and seven-second alternating animation modes.
 - Reads ZCode's cached plan quota locally and the local OmniRoute SQLite database in read-only mode. The OmniRoute query is limited to provider/account display labels and latest quota snapshot fields; it never reads API keys, access or refresh tokens, cookies, ID tokens, or provider credential blobs.
 - Shows a direct account view for single-account providers and a combined average only where several accounts share a provider. Every available reset shows both a relative time and the exact timestamp.
+- Lists all OmniRoute Codex accounts, including disabled connections and their last saved usage snapshots. A compact, optional global Codex reset estimate based on public OpenAI staff signals can appear under the provider accounts.
 - Collapses Google Antigravity into its two meaningful shared weekly pools: Gemini and all other models. NVIDIA connections are identified as unmetered when the provider exposes no measurable quota.
 - Treats GitHub Copilot Chat and Completions as unavailable when OmniRoute reports a non-exhausted zero value, avoiding false empty bars.
 - Reads official ChatGPT Codex rate limits through the documented local Codex app-server account and rate-limit methods. It displays provider-reported percentages and reset timestamps when a ChatGPT account is available to the Codex profile.

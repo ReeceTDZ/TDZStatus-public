@@ -196,7 +196,7 @@ struct DashboardView: View {
                         symbol: "chart.bar.xaxis",
                         title: "No provider accounts found",
                         detail: model.omniRouteStatus == .connected
-                            ? "OmniRoute has no active provider connections yet."
+                            ? "OmniRoute has no provider connections yet."
                             : "Connect OmniRoute to show provider usage here."
                     )
                 } else {
@@ -205,6 +205,9 @@ struct DashboardView: View {
                             ProviderPoolCard(pool: pool, expandedProvider: $expandedProvider, splitAccounts: model.splitAccounts, configureCookie: configureCookie)
                         }
                     }
+                }
+                if model.showCodexGlobalEstimate {
+                    GlobalResetEstimateCard(model: model)
                 }
             }
             ZCodeUsageCard(model: model, compact: true)
@@ -276,11 +279,12 @@ struct DashboardView: View {
                 }
             }
 
-            ZCodeUsageCard(model: model, compact: false)
-            CodexOfficialCard(model: model, compact: false)
             if model.showCodexGlobalEstimate {
                 GlobalResetEstimateCard(model: model)
             }
+
+            ZCodeUsageCard(model: model, compact: false)
+            CodexOfficialCard(model: model, compact: false)
         }
         .padding(18)
     }
@@ -419,13 +423,18 @@ struct DashboardView: View {
 
             SettingsCard(title: "OpenAI reset estimates", symbol: "clock.arrow.circlepath") {
                 VStack(alignment: .leading, spacing: 8) {
-                    Toggle("Show global community reset forecast", isOn: $model.showCodexGlobalEstimate)
+                    Toggle("Show the staff signal estimate below provider accounts", isOn: $model.showCodexGlobalEstimate)
                         .toggleStyle(.switch)
-                        .font(.system(size: 12))
-                    Text("Personal limits and reset times come from the official Codex app-server. The optional global forecast reads codex-reset.com once per minute or less and does not predict your account’s quota reset.")
+                        .font(.system(size: 11))
+                    Text("The compact estimate appears below provider accounts. It reads codex-reset.com no more than once per minute and reflects a global forecast from public OpenAI staff signals, not an account-specific reset.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                    Button(model.isRefreshingCodexResetForecast ? "Updating estimate…" : "Refresh estimate") {
+                        model.refreshCodexResetForecast()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!model.showCodexGlobalEstimate || model.isRefreshingCodexResetForecast || !model.canRefreshCodexResetForecast)
                 }
             }
 
@@ -542,6 +551,7 @@ private struct ProviderPoolCard: View {
 
     private var summaryDetail: String {
         if pool.isNVIDIA { return "No measurable quota exposed" }
+        if pool.isCodex { return "\(pool.accountCount) accounts · disabled accounts included" }
         if let account = pool.accounts.first, pool.isSingleAccount {
             return "\(account.displayName) · direct account"
         }
@@ -560,7 +570,13 @@ private struct ProviderPoolCard: View {
         VStack(alignment: .leading, spacing: 11) {
             header
 
-            if pool.isNVIDIA {
+            if pool.isCodex {
+                if fullWidth {
+                    accountBreakdown
+                } else {
+                    codexAccountSummary
+                }
+            } else if pool.isNVIDIA {
                 noMeasuredQuota
             } else if pool.windowKeys.isEmpty {
                 noSnapshot
@@ -568,7 +584,7 @@ private struct ProviderPoolCard: View {
                 usageSummary
             }
 
-            if isExpanded || (splitAccounts && !pool.isSingleAccount && !pool.isNVIDIA) {
+            if !pool.isCodex && (isExpanded || (splitAccounts && !pool.isSingleAccount && !pool.isNVIDIA)) {
                 accountBreakdown
             }
         }
@@ -679,6 +695,18 @@ private struct ProviderPoolCard: View {
         }
     }
 
+    private var codexAccountSummary: some View {
+        let disabledCount = pool.accounts.filter { !$0.isActive }.count
+        let activeCount = pool.accountCount - disabledCount
+        return HStack(spacing: 6) {
+            Image(systemName: "person.2")
+                .foregroundStyle(.secondary)
+            Text("\(activeCount) active · \(disabledCount) disabled")
+                .foregroundStyle(.secondary)
+        }
+        .font(.system(size: 9, weight: .medium))
+    }
+
     @ViewBuilder
     private func accountDetail(_ account: ProviderAccount) -> some View {
         let accountWindows = pool.windows(for: account)
@@ -691,9 +719,9 @@ private struct ProviderPoolCard: View {
                     .font(.system(size: 10, weight: .semibold))
                     .lineLimit(1)
                 Spacer()
-                Text(accountWindows.isEmpty ? "Needs dashboard" : "Reporting")
+                Text(!account.isActive ? "Disabled" : accountWindows.isEmpty ? "Needs dashboard" : "Reporting")
                     .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(accountWindows.isEmpty ? Color.secondary : Color.green)
+                    .foregroundStyle(!account.isActive ? Color.orange : accountWindows.isEmpty ? Color.secondary : Color.green)
             }
             if accountWindows.isEmpty {
                 Text("No trackable quota was recorded for this account.")
@@ -978,89 +1006,63 @@ private struct GlobalResetEstimateCard: View {
     @ObservedObject var model: TDZStatusModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
-                Image(systemName: "sparkles")
-                    .foregroundStyle(.orange)
-                Text("Global Codex reset forecast")
-                    .font(.system(size: 11, weight: .bold))
-                Spacer()
-                Text("COMMUNITY")
-                    .font(.system(size: 8, weight: .bold))
-                    .tracking(0.5)
-                    .foregroundStyle(.orange)
-            }
-            Text("Global community forecast from public OpenAI staff signals. It is not a personal quota reset prediction.")
-                .font(.system(size: 9))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+        HStack(spacing: 10) {
+            Image(systemName: "clock.arrow.circlepath")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.orange)
+                .frame(width: 28, height: 28)
+                .background(.orange.opacity(0.11), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-            if let forecast = model.codexResetForecast {
-                HStack(spacing: 8) {
-                    forecastMetric("Next 24 hours", value: forecast.probability.next24Hours)
-                    forecastMetric("Next 48 hours", value: forecast.probability.next48Hours)
-                }
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 5) {
-                    if let confidence = forecast.confidence {
-                        Text("Confidence: \(confidence.capitalized)")
-                    }
-                    if let window = forecast.likelyWindow {
-                        Text("· Likely window: \(window) \(forecast.likelyWindowTimeZone ?? "")")
-                    }
+                    Text("Codex reset estimate · OpenAI staff")
+                        .font(.system(size: 10, weight: .semibold))
                 }
-                .font(.system(size: 8, weight: .medium))
-                .foregroundStyle(.secondary)
-                if let lastReset = forecast.lastResetAt {
-                    Text("Last confirmed global reset \(lastReset.formatted(date: .abbreviated, time: .shortened)) · \(lastReset.formatted(.relative(presentation: .named)))")
-                        .font(.system(size: 8, weight: .medium))
+
+                if let forecast = model.codexResetForecast {
+                    HStack(spacing: 6) {
+                        Text("24h \(forecast.probability.next24Hours)%")
+                        Text("·")
+                        Text("48h \(forecast.probability.next48Hours)%")
+                        if let window = forecast.likelyWindow {
+                            Text("·")
+                            Text("\(window) \(forecast.likelyWindowTimeZone ?? "")")
+                                .lineLimit(1)
+                        }
+                    }
+                    .font(.system(size: 8, weight: .medium, design: .rounded))
+                    .foregroundStyle(.secondary)
+                    Text("Global estimate · not account-specific")
+                        .font(.system(size: 7))
+                        .foregroundStyle(.tertiary)
+                } else if let error = model.codexResetForecastError {
+                    Text(error)
+                        .font(.system(size: 8))
+                        .foregroundStyle(.orange)
+                        .lineLimit(1)
+                } else {
+                    Text(model.isRefreshingCodexResetForecast ? "Loading estimate…" : "Estimate unavailable")
+                        .font(.system(size: 8))
                         .foregroundStyle(.secondary)
                 }
-                if let updated = forecast.updatedAt {
-                    Text("Forecast updated \(updated.formatted(date: .omitted, time: .shortened))")
-                        .font(.system(size: 8))
-                        .foregroundStyle(.tertiary)
-                }
-            } else if let error = model.codexResetForecastError {
-                Text(error)
-                    .font(.system(size: 9))
-                    .foregroundStyle(.orange)
-            } else {
-                Text(model.isRefreshingCodexResetForecast ? "Loading community forecast…" : "The global forecast will appear here when available.")
-                    .font(.system(size: 9))
+            }
+
+            Spacer(minLength: 4)
+
+            Link(destination: URL(string: "https://codex-reset.com/")!) {
+                Image(systemName: "arrow.up.right")
+                    .font(.system(size: 8, weight: .semibold))
                     .foregroundStyle(.secondary)
             }
-
-            HStack(spacing: 12) {
-                Link("Data: codex-reset.com", destination: URL(string: "https://codex-reset.com/")!)
-                    .font(.system(size: 9, weight: .semibold))
-                Button(model.isRefreshingCodexResetForecast ? "Updating…" : "Refresh") {
-                    model.refreshCodexResetForecast()
-                }
-                .font(.system(size: 9, weight: .semibold))
-                .buttonStyle(.plain)
-                .disabled(model.isRefreshingCodexResetForecast || !model.canRefreshCodexResetForecast)
-                Link("Details", destination: URL(string: "https://codex-reset.com/developers/")!)
-                    .font(.system(size: 9, weight: .medium))
-            }
+            .help("Forecast based on public OpenAI staff signals")
         }
-        .padding(13)
+        .padding(.horizontal, 11)
+        .padding(.vertical, 9)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.orange.opacity(0.055), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(.orange.opacity(0.14)))
-    }
-
-    private func forecastMetric(_ label: String, value: Int) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text("\(value)%")
-                .font(.system(size: 17, weight: .bold, design: .rounded))
-                .monospacedDigit()
-            Text(label)
-                .font(.system(size: 8, weight: .medium))
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(9)
-        .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .background(.orange.opacity(0.045), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(.orange.opacity(0.12)))
+        .accessibilityElement(children: .contain)
+        .help("A global estimate based on public OpenAI staff signals, not a personal account reset.")
     }
 }
 
