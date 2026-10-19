@@ -96,10 +96,47 @@ struct ProviderPool: Identifiable {
     var windows: [QuotaWindow] { accounts.flatMap(\.windows) }
     var accountCount: Int { accounts.count }
     var accountsWithUsage: Int { accounts.filter(\.hasUsage).count }
-    var windowKeys: [String] { Array(Set(windows.map(\.key))).sorted() }
+    var isSingleAccount: Bool { accountCount == 1 }
+    var isNVIDIA: Bool { provider.caseInsensitiveCompare("nvidia") == .orderedSame }
+    var isAntigravity: Bool { provider.caseInsensitiveCompare("antigravity") == .orderedSame }
+    var isGitHubCopilot: Bool { provider.caseInsensitiveCompare("github") == .orderedSame }
+
+    /// Some integrations publish individual model entries even though their
+    /// consumption is charged against one shared window. Only show windows
+    /// that represent independently meaningful limits.
+    func shows(_ window: QuotaWindow) -> Bool {
+        if isNVIDIA { return false }
+        if isAntigravity {
+            return ["gemini_weekly", "claude_gpt_weekly"].contains(window.key)
+        }
+        // OmniRoute currently records 0% for these Copilot entries even when
+        // they are not exhausted. Treat that value as unavailable rather than
+        // rendering a false empty bar.
+        if isGitHubCopilot,
+           ["chat", "completions"].contains(window.key),
+           window.remainingPercentage == 0,
+           !window.isExhausted {
+            return false
+        }
+        return true
+    }
+
+    var windowKeys: [String] {
+        Array(Set(windows.filter(shows).map(\.key))).sorted { lhs, rhs in
+            displayQuotaWindowName(lhs, provider: provider)
+                .localizedCaseInsensitiveCompare(displayQuotaWindowName(rhs, provider: provider)) == .orderedAscending
+        }
+    }
 
     func accounts(for key: String) -> [QuotaWindow] {
-        windows.filter { $0.key == key }
+        windows.filter { $0.key == key && shows($0) }
+    }
+
+    func windows(for account: ProviderAccount) -> [QuotaWindow] {
+        account.windows.filter(shows).sorted {
+            displayQuotaWindowName($0.key, provider: provider)
+                .localizedCaseInsensitiveCompare(displayQuotaWindowName($1.key, provider: provider)) == .orderedAscending
+        }
     }
 
     /// Providers expose percentages rather than a consistent absolute quota.
@@ -114,6 +151,28 @@ struct ProviderPool: Identifiable {
     func nextReset(for key: String) -> Date? {
         accounts(for: key).compactMap(\.resetsAt).min()
     }
+}
+
+func displayQuotaWindowName(_ key: String, provider: String) -> String {
+    if provider.caseInsensitiveCompare("antigravity") == .orderedSame {
+        switch key {
+        case "gemini_weekly": return "Gemini · weekly"
+        case "claude_gpt_weekly": return "Other models · weekly"
+        default: break
+        }
+    }
+    if provider.caseInsensitiveCompare("github") == .orderedSame {
+        switch key {
+        case "premium_interactions": return "Premium interactions"
+        case "chat": return "Chat"
+        case "completions": return "Completions"
+        default: break
+        }
+    }
+    return key
+        .replacingOccurrences(of: "_", with: " ")
+        .replacingOccurrences(of: "-", with: " ")
+        .capitalized
 }
 
 struct CodexQuotaWindow: Identifiable, Hashable {
@@ -184,6 +243,18 @@ enum DashboardSection: String, CaseIterable, Identifiable {
 }
 
 func displayProviderName(_ provider: String) -> String {
+    let identifier = provider.lowercased()
+    if identifier.hasPrefix("anthropic-compatible") { return "Anthropic Compatible" }
+    if identifier.hasPrefix("openai-compatible-chat") { return "OpenAI Compatible" }
+    switch identifier {
+    case "antigravity": return "Google Antigravity"
+    case "github": return "GitHub Copilot"
+    case "nvidia": return "NVIDIA"
+    case "xkiro": return "xKiro"
+    case "orcarouter": return "OrcaRouter"
+    case "openrouter": return "OpenRouter"
+    default: break
+    }
     let normalized = provider
         .replacingOccurrences(of: "-", with: " ")
         .replacingOccurrences(of: "_", with: " ")

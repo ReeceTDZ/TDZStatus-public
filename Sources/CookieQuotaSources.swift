@@ -1,6 +1,22 @@
 import Foundation
 import Security
 
+enum CookieQuotaValueMode: String, Codable, CaseIterable, Identifiable {
+    case remainingPercentage
+    case usedPercentage
+    case usedOfLimit
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .remainingPercentage: "Remaining percentage"
+        case .usedPercentage: "Used percentage"
+        case .usedOfLimit: "Used amount and limit"
+        }
+    }
+}
+
 struct CookieQuotaSource: Codable, Identifiable, Hashable {
     var id: String
     var provider: String
@@ -12,7 +28,15 @@ struct CookieQuotaSource: Codable, Identifiable, Hashable {
     var resetField: String
     var durationField: String
     var valueIsUsedPercentage: Bool
+    /// Optional fields preserve compatibility with dashboard sources saved by
+    /// earlier releases, which only supported percentage-valued responses.
+    var valueMode: CookieQuotaValueMode? = nil
+    var limitField: String? = nil
     var updatedAt: Date
+
+    var effectiveValueMode: CookieQuotaValueMode {
+        valueMode ?? (valueIsUsedPercentage ? .usedPercentage : .remainingPercentage)
+    }
 }
 
 enum CookieQuotaError: LocalizedError {
@@ -147,7 +171,21 @@ final class CookieQuotaFetcher {
             }
             do {
                 let value = try self.number(at: source.remainingField, in: object)
-                let remaining = source.valueIsUsedPercentage ? 100 - value : value
+                let remaining: Double
+                switch source.effectiveValueMode {
+                case .remainingPercentage:
+                    remaining = value
+                case .usedPercentage:
+                    remaining = 100 - value
+                case .usedOfLimit:
+                    guard let limitPath = source.limitField?.trimmingCharacters(in: .whitespacesAndNewlines),
+                          !limitPath.isEmpty else {
+                        throw CookieQuotaError.missingField("usage limit")
+                    }
+                    let limit = try self.number(at: limitPath, in: object)
+                    guard limit > 0 else { throw CookieQuotaError.invalidNumber(limitPath) }
+                    remaining = 100 * (limit - value) / limit
+                }
                 let resetValue = self.value(at: source.resetField, in: object)
                 let resetDate = self.date(from: resetValue)
                 let duration = source.durationField.isEmpty ? nil : try? self.number(at: source.durationField, in: object)

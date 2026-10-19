@@ -79,7 +79,13 @@ final class TDZStatusModel: ObservableObject {
     }
 
     var accountsMissingQuota: [ProviderAccount] {
-        accounts.filter { $0.windows.isEmpty }
+        accounts.filter {
+            $0.provider.caseInsensitiveCompare("nvidia") != .orderedSame && $0.windows.isEmpty
+        }
+    }
+
+    var hasMultiAccountPools: Bool {
+        providerPools.contains { $0.accountCount > 1 }
     }
 
     var codexProvidersMissingFromOmniRoute: [String] {

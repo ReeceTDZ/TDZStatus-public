@@ -252,17 +252,19 @@ struct DashboardView: View {
             VStack(alignment: .leading, spacing: 5) {
                 Text("Provider usage")
                     .font(.system(size: 20, weight: .bold, design: .rounded))
-                Text("Combined view uses the average remaining percentage when a provider only reports percentages. Account rows keep every limit separate.")
+                Text("Providers with several accounts show an average remaining percentage. A provider with one account is shown directly, and resets include the exact timestamp.")
                     .font(.system(size: 11))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
-            Picker("Display", selection: $model.splitAccounts) {
-                Text("Combined pools").tag(false)
-                Text("By account").tag(true)
+            if model.hasMultiAccountPools {
+                Picker("Display", selection: $model.splitAccounts) {
+                    Text("Combined pools").tag(false)
+                    Text("By account").tag(true)
+                }
+                .pickerStyle(.segmented)
             }
-            .pickerStyle(.segmented)
 
             if model.providerPools.isEmpty {
                 EmptyStateCard(symbol: "tray", title: "No provider connections", detail: "Connect OmniRoute to find configured provider accounts.")
@@ -309,9 +311,16 @@ struct DashboardView: View {
             }
 
             SettingsCard(title: "Usage display", symbol: "chart.bar.xaxis") {
-                Toggle("Show accounts separately", isOn: $model.splitAccounts)
-                    .toggleStyle(.switch)
-                    .font(.system(size: 12))
+                if model.hasMultiAccountPools {
+                    Toggle("Show accounts separately", isOn: $model.splitAccounts)
+                        .toggleStyle(.switch)
+                        .font(.system(size: 12))
+                } else {
+                    Text("Single-account providers are shown directly. Account splitting appears when a provider has multiple connected accounts.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             SettingsCard(title: "Connections", symbol: "link") {
@@ -360,7 +369,7 @@ struct DashboardView: View {
 
             SettingsCard(title: "Provider dashboard cookies", symbol: "key.horizontal") {
                 VStack(alignment: .leading, spacing: 10) {
-                    Text("Use this for an account whose OmniRoute quota snapshot is missing. Configure the provider’s JSON usage endpoint and field paths; each provider website exposes a different format.")
+                    Text("Use this when OmniRoute does not publish an account quota. xKiro has a ready-to-use dashboard preset; custom endpoints support percentage or used-and-limit values.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -527,103 +536,214 @@ private struct ProviderPoolCard: View {
     var fullWidth = false
     var configureCookie: (ProviderAccount) -> Void
 
+    private var isExpanded: Bool {
+        !pool.isSingleAccount && expandedProvider == pool.id
+    }
+
+    private var summaryDetail: String {
+        if pool.isNVIDIA { return "No measurable quota exposed" }
+        if let account = pool.accounts.first, pool.isSingleAccount {
+            return "\(account.displayName) · direct account"
+        }
+        return "\(pool.accountsWithUsage) of \(pool.accountCount) accounts reporting"
+    }
+
+    private var hasHiddenGitHubLimits: Bool {
+        pool.isGitHubCopilot && pool.windows.contains {
+            ["chat", "completions"].contains($0.key)
+                && $0.remainingPercentage == 0
+                && !$0.isExhausted
+        }
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Button {
-                expandedProvider = expandedProvider == pool.id ? nil : pool.id
-            } label: {
-                HStack(alignment: .center, spacing: 9) {
-                    ProviderGlyph(provider: pool.provider)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(displayProviderName(pool.provider))
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(.primary)
-                        Text("\(pool.accountsWithUsage) of \(pool.accountCount) accounts reporting")
-                            .font(.system(size: 9, weight: .medium))
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer(minLength: 0)
-                    Image(systemName: expandedProvider == pool.id ? "chevron.up" : "chevron.down")
+        VStack(alignment: .leading, spacing: 11) {
+            header
+
+            if pool.isNVIDIA {
+                noMeasuredQuota
+            } else if pool.windowKeys.isEmpty {
+                noSnapshot
+            } else {
+                usageSummary
+            }
+
+            if isExpanded || (splitAccounts && !pool.isSingleAccount && !pool.isNVIDIA) {
+                accountBreakdown
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: fullWidth ? .infinity : nil, alignment: .leading)
+        .background(.quaternary.opacity(0.42), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(.primary.opacity(0.06)))
+    }
+
+    private var header: some View {
+        Button {
+            guard !pool.isSingleAccount else { return }
+            expandedProvider = isExpanded ? nil : pool.id
+        } label: {
+            HStack(alignment: .center, spacing: 9) {
+                ProviderGlyph(provider: pool.provider)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(displayProviderName(pool.provider))
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundStyle(.primary)
+                    Text(summaryDetail)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
+                if !pool.isSingleAccount {
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                         .font(.system(size: 9, weight: .bold))
                         .foregroundStyle(.tertiary)
                 }
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(pool.isSingleAccount)
+    }
 
-            if pool.windowKeys.isEmpty {
-                Text("No quota snapshot yet")
-                    .font(.system(size: 10, weight: .medium))
+    private var noMeasuredQuota: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "infinity")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 18, height: 18)
+                .background(.quaternary, in: Circle())
+            VStack(alignment: .leading, spacing: 3) {
+                Text("No measurable usage limit")
+                    .font(.system(size: 10, weight: .semibold))
+                Text("NVIDIA does not expose a quota that TDZStatus can track for this connection.")
+                    .font(.system(size: 9))
                     .foregroundStyle(.secondary)
-                ProgressView(value: 0)
-                    .tint(Color.gray.opacity(0.4))
-                if pool.accounts.count == 1, let account = pool.accounts.first {
-                    Button("Add dashboard cookie for \(account.displayName)…") { configureCookie(account) }
-                        .font(.system(size: 9, weight: .semibold))
-                        .buttonStyle(.link)
-                }
-            } else {
-                ForEach(pool.windowKeys.prefix(fullWidth ? 5 : 2), id: \.self) { key in
-                    let remaining = pool.averageRemaining(for: key)
-                    VStack(alignment: .leading, spacing: 5) {
-                        HStack {
-                            Text(key.replacingOccurrences(of: "_", with: " ").capitalized)
-                                .font(.system(size: 9, weight: .medium))
-                                .lineLimit(1)
-                            Spacer(minLength: 4)
-                            if let remaining {
-                                Text("\(Int(remaining.rounded()))% left")
-                                    .font(.system(size: 9, weight: .semibold, design: .rounded))
-                                    .monospacedDigit()
-                            }
-                        }
-                        UsageProgress(remaining: remaining)
-                        if let reset = pool.nextReset(for: key) {
-                            Text("Next reset \(reset.formatted(.relative(presentation: .named)))")
-                                .font(.system(size: 8, weight: .medium))
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                }
+                    .fixedSize(horizontal: false, vertical: true)
             }
+        }
+        .padding(.vertical, 2)
+    }
 
-            if expandedProvider == pool.id || splitAccounts {
-                Divider().opacity(0.5)
-                ForEach(pool.accounts) { account in
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 6) {
-                            Image(systemName: "person.crop.circle")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
-                            Text(account.displayName)
-                                .font(.system(size: 10, weight: .semibold))
-                                .lineLimit(1)
-                            Spacer()
-                            Text(account.hasUsage ? "Live" : "Awaiting usage")
-                                .font(.system(size: 8, weight: .medium))
-                                .foregroundStyle(account.hasUsage ? .green : .secondary)
-                        }
-                        if account.windows.isEmpty {
-                            Text("OmniRoute has not recorded a quota window for this account.")
-                                .font(.system(size: 9))
-                                .foregroundStyle(.tertiary)
-                            Button("Add dashboard cookie…") { configureCookie(account) }
-                                .font(.system(size: 9, weight: .semibold))
-                                .buttonStyle(.link)
-                        } else {
-                            ForEach(account.windows) { window in
-                                UsageWindowLine(window: window)
-                            }
-                        }
-                    }
-                    .padding(.top, 1)
+    private var noSnapshot: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("No quota snapshot yet")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text(pool.isSingleAccount
+                ? "Connect this provider dashboard to show its current allowance and reset."
+                : "Open an account row to connect a provider dashboard.")
+                .font(.system(size: 9))
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+            if pool.isSingleAccount, let account = pool.accounts.first {
+                Button(cookieButtonTitle(for: account)) { configureCookie(account) }
+                    .font(.system(size: 9, weight: .semibold))
+                    .buttonStyle(.link)
+            }
+        }
+    }
+
+    private var usageSummary: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            if pool.isAntigravity {
+                Label("Two shared weekly pools: Gemini and all other models.", systemImage: "link")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(pool.windowKeys.prefix(fullWidth ? 5 : 2), id: \.self) { key in
+                UsageSummaryLine(
+                    title: displayQuotaWindowName(key, provider: pool.provider),
+                    remaining: pool.averageRemaining(for: key),
+                    reset: pool.nextReset(for: key)
+                )
+            }
+            if hasHiddenGitHubLimits {
+                Label("Chat and Completions do not report a measurable quota in this Copilot snapshot.", systemImage: "info.circle")
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var accountBreakdown: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            Divider().opacity(0.5)
+            Text("Accounts")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(.secondary)
+            ForEach(pool.accounts.indices, id: \.self) { index in
+                accountDetail(pool.accounts[index])
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func accountDetail(_ account: ProviderAccount) -> some View {
+        let accountWindows = pool.windows(for: account)
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 6) {
+                Image(systemName: "person.crop.circle")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Text(account.displayName)
+                    .font(.system(size: 10, weight: .semibold))
+                    .lineLimit(1)
+                Spacer()
+                Text(accountWindows.isEmpty ? "Needs dashboard" : "Reporting")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(accountWindows.isEmpty ? Color.secondary : Color.green)
+            }
+            if accountWindows.isEmpty {
+                Text("No trackable quota was recorded for this account.")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+                Button(cookieButtonTitle(for: account)) { configureCookie(account) }
+                    .font(.system(size: 9, weight: .semibold))
+                    .buttonStyle(.link)
+            } else {
+                ForEach(accountWindows) { window in
+                    UsageWindowLine(window: window)
                 }
             }
         }
-        .padding(13)
-        .frame(maxWidth: fullWidth ? .infinity : nil, alignment: .leading)
-        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 15).strokeBorder(.primary.opacity(0.055)))
+        .padding(.top, 1)
+    }
+
+    private func cookieButtonTitle(for account: ProviderAccount) -> String {
+        pool.provider.caseInsensitiveCompare("xkiro") == .orderedSame
+            ? "Connect xKiro dashboard…"
+            : "Connect provider dashboard…"
+    }
+}
+
+private struct UsageSummaryLine: View {
+    let title: String
+    let remaining: Double?
+    let reset: Date?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text(title)
+                    .font(.system(size: 9, weight: .medium))
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                if let remaining {
+                    Text("\(Int(remaining.rounded()))% left")
+                        .font(.system(size: 9, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                }
+            }
+            UsageProgress(remaining: remaining)
+            if let reset {
+                Text(resetCaption(reset))
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+        }
     }
 }
 
@@ -631,9 +751,9 @@ private struct UsageWindowLine: View {
     let window: QuotaWindow
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 5) {
             HStack {
-                Text(window.key.replacingOccurrences(of: "_", with: " ").capitalized)
+                Text(displayQuotaWindowName(window.key, provider: window.provider))
                     .font(.system(size: 9, weight: .medium))
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -644,19 +764,22 @@ private struct UsageWindowLine: View {
                 }
             }
             UsageProgress(remaining: window.remainingPercentage)
-            HStack {
-                Text(window.isExhausted ? "Limit reached" : "Usage")
-                Spacer()
-                if let reset = window.resetsAt {
-                    Text("Resets \(reset.formatted(.relative(presentation: .named)))")
-                } else {
-                    Text("Reset time unavailable")
-                }
+            if let reset = window.resetsAt {
+                Text(resetCaption(reset))
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(window.isExhausted ? Color.red : Color.secondary.opacity(0.65))
+                    .lineLimit(1)
+            } else {
+                Text(window.isExhausted ? "Limit reached · reset unavailable" : "Reset time unavailable")
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(window.isExhausted ? Color.red : Color.secondary.opacity(0.65))
             }
-            .font(.system(size: 8, weight: .medium))
-            .foregroundStyle(window.isExhausted ? Color.red : Color.secondary.opacity(0.65))
         }
     }
+}
+
+private func resetCaption(_ reset: Date) -> String {
+    "Resets \(reset.formatted(.relative(presentation: .named))) · \(reset.formatted(date: .abbreviated, time: .shortened))"
 }
 
 private struct UsageProgress: View {
