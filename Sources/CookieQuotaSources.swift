@@ -86,6 +86,16 @@ enum CookieQuotaError: LocalizedError {
 final class CookieQuotaSourceStore {
     private let defaultsKey = "cookieQuotaSources"
     private let service = "com.reecedove.tdzstatus.provider-cookie"
+    private let sharedAccount = "provider-cookies-v1"
+    private var sharedCookies: [String: String]?
+
+    private var sharedQuery: [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: sharedAccount,
+        ]
+    }
 
     func sources() -> [CookieQuotaSource] {
         guard let data = UserDefaults.standard.data(forKey: defaultsKey),
@@ -96,32 +106,24 @@ final class CookieQuotaSourceStore {
     func save(_ source: CookieQuotaSource, cookie: String) throws {
         let cleaned = cookie.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleaned.isEmpty else { throw CookieQuotaError.emptyCookie }
-        let account = source.id as CFString
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
-        let update: [String: Any] = [kSecValueData as String: Data(cleaned.utf8)]
-        let status = SecItemUpdate(base as CFDictionary, update as CFDictionary)
-        if status == errSecItemNotFound {
-            var item = base
-            item[kSecValueData as String] = Data(cleaned.utf8)
-            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-            let addStatus = SecItemAdd(item as CFDictionary, nil)
-            guard addStatus == errSecSuccess else { throw CookieQuotaError.keychain(SecCopyErrorMessageString(addStatus, nil) as String? ?? "Keychain error \(addStatus)") }
-        } else if status != errSecSuccess {
-            throw CookieQuotaError.keychain(SecCopyErrorMessageString(status, nil) as String? ?? "Keychain error \(status)")
-        }
+        var current = try loadSharedCookies()
+        current[source.id] = cleaned
+        try storeSharedCookies(current)
+        sharedCookies = current
 
-        var current = sources().filter { $0.id != source.id }
-        current.append(source)
-        current.sort { $0.provider.localizedCaseInsensitiveCompare($1.provider) == .orderedAscending }
-        let data = try JSONEncoder().encode(current)
+        var updatedSources = sources().filter { $0.id != source.id }
+        updatedSources.append(source)
+        updatedSources.sort { $0.provider.localizedCaseInsensitiveCompare($1.provider) == .orderedAscending }
+        let data = try JSONEncoder().encode(updatedSources)
         UserDefaults.standard.set(data, forKey: defaultsKey)
     }
 
     func cookie(for sourceID: String) throws -> String {
+        var current = try loadSharedCookies()
+        if let value = current[sourceID] { return value }
+
+        // Older releases kept one Keychain item per cookie source. Read and
+        // migrate it once; subsequent refreshes read the shared item instead.
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -135,10 +137,27 @@ final class CookieQuotaSourceStore {
               let value = String(data: data, encoding: .utf8) else {
             throw CookieQuotaError.keychain(SecCopyErrorMessageString(status, nil) as String? ?? "Keychain item is unavailable")
         }
+        current[sourceID] = value
+        // Reading an older item succeeded, so keep the credential usable even
+        // if Keychain rejects the one-time migration write. The in-memory cache
+        // still prevents the two-minute refresh timer from prompting again.
+        sharedCookies = current
+        try? storeSharedCookies(current)
         return value
     }
 
     func remove(_ sourceID: String) {
+        if var current = try? loadSharedCookies() {
+            current.removeValue(forKey: sourceID)
+            if current.isEmpty {
+                SecItemDelete(sharedQuery as CFDictionary)
+                sharedCookies = [:]
+            } else if (try? storeSharedCookies(current)) != nil {
+                sharedCookies = current
+            }
+        }
+
+        // Clean up the per-source item written by older releases as well.
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -148,6 +167,44 @@ final class CookieQuotaSourceStore {
         let current = sources().filter { $0.id != sourceID }
         if let data = try? JSONEncoder().encode(current) {
             UserDefaults.standard.set(data, forKey: defaultsKey)
+        }
+    }
+
+    private func loadSharedCookies() throws -> [String: String] {
+        if let sharedCookies { return sharedCookies }
+
+        var query = sharedQuery
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == errSecItemNotFound {
+            sharedCookies = [:]
+            return [:]
+        }
+        guard status == errSecSuccess, let data = result as? Data,
+              let cookies = try? JSONDecoder().decode([String: String].self, from: data) else {
+            throw CookieQuotaError.keychain(SecCopyErrorMessageString(status, nil) as String? ?? "Keychain item is unavailable")
+        }
+        sharedCookies = cookies
+        return cookies
+    }
+
+    private func storeSharedCookies(_ cookies: [String: String]) throws {
+        let data = try JSONEncoder().encode(cookies)
+        let update: [String: Any] = [kSecValueData as String: data]
+        let status = SecItemUpdate(sharedQuery as CFDictionary, update as CFDictionary)
+        if status == errSecItemNotFound {
+            var item = sharedQuery
+            item[kSecValueData as String] = data
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+            let addStatus = SecItemAdd(item as CFDictionary, nil)
+            guard addStatus == errSecSuccess else {
+                throw CookieQuotaError.keychain(SecCopyErrorMessageString(addStatus, nil) as String? ?? "Keychain error \(addStatus)")
+            }
+        } else if status != errSecSuccess {
+            throw CookieQuotaError.keychain(SecCopyErrorMessageString(status, nil) as String? ?? "Keychain error \(status)")
         }
     }
 }
