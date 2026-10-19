@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import Network
 
 enum OmniRouteStatus: Equatable {
     case disconnected
@@ -37,6 +38,49 @@ final class TDZStatusModel: ObservableObject {
     @Published var refreshMessage: String?
     @Published private(set) var isRefreshingUsage = false
     @Published private(set) var hasOmniRouteRefreshSession = false
+    @Published var notifyOnTaskCompletion: Bool {
+        didSet {
+            UserDefaults.standard.set(notifyOnTaskCompletion, forKey: "notifyOnTaskCompletion")
+            if notifyOnTaskCompletion { notificationCenter.requestAuthorizationIfNeeded() }
+        }
+    }
+    @Published var notifyNearUsageLimits: Bool {
+        didSet {
+            UserDefaults.standard.set(notifyNearUsageLimits, forKey: "notifyNearUsageLimits")
+            if notifyNearUsageLimits { notificationCenter.requestAuthorizationIfNeeded() }
+        }
+    }
+    @Published private(set) var launchAtLoginEnabled: Bool
+    @Published private(set) var launchAtLoginMessage: String?
+    @Published var codeSleepEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(codeSleepEnabled, forKey: "codeSleepEnabled")
+            updateCodeSleep()
+        }
+    }
+    @Published var pauseOtherAppsEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(pauseOtherAppsEnabled, forKey: "pauseOtherAppsEnabled")
+            updateCodeSleep()
+        }
+    }
+    @Published var autoConnectPhoneHotspot: Bool {
+        didSet {
+            UserDefaults.standard.set(autoConnectPhoneHotspot, forKey: "autoConnectPhoneHotspot")
+            if autoConnectPhoneHotspot {
+                hotspotStatusMessage = hotspotSSID.isEmpty
+                    ? "Set up your hotspot name and password."
+                    : "Watching the network connection."
+                attemptPhoneHotspotConnection()
+            } else {
+                hotspotStatusMessage = "Automatic hotspot connection is off."
+            }
+            updateHotspotRetryTimer()
+        }
+    }
+    @Published private(set) var hotspotSSID: String
+    @Published private(set) var hotspotStatusMessage = "Automatic hotspot connection is off."
+    @Published private(set) var codeSleepHolding = false
     @Published var showOnboarding: Bool
     @Published var iconPreference: IconPreference {
         didSet { UserDefaults.standard.set(iconPreference.rawValue, forKey: "iconPreference") }
@@ -61,8 +105,24 @@ final class TDZStatusModel: ObservableObject {
     private var resetForecastAllowedAfter = Date.distantPast
     private var zcodeReadInProgress = false
     private var cookieRequestsInProgress: Set<String> = []
+    private var hasInitialHarnessSnapshot = false
+    private var taskTokenBaselines: [HarnessKind: Int64] = [:]
+    private var taskTokenReadIDs: [HarnessKind: UUID] = [:]
+    private var activeOmniRouteRefreshID: UUID?
+    private var networkIsSatisfied = true
+    private var hotspotConnectInProgress = false
+    private var lastHotspotAttempt = Date.distantPast
+    private var hotspotRetryTimer: Timer?
+    private var cachedHotspotPasswords: [String: String] = [:]
+    private var pathMonitorStarted = false
     private let codexBridge = CodexUsageBridge()
+    private let codexTokenUsageReader = CodexTokenUsageReader()
     private let codexResetForecastFetcher = CodexResetForecastFetcher()
+    private let notificationCenter = TDZStatusNotificationCenter.shared
+    private let codeSleepController = CodeSleepController()
+    private let hotspotCredentialStore = HotspotCredentialStore()
+    private let hotspotPathMonitor = NWPathMonitor()
+    private let hotspotMonitorQueue = DispatchQueue(label: "com.reecedove.tdzstatus.network-monitor")
     private let cookieSourceStore = CookieQuotaSourceStore()
     private let cookieQuotaFetcher = CookieQuotaFetcher()
     private let omniRouteRefreshSessionStore = OmniRouteDashboardSessionStore()
@@ -149,10 +209,23 @@ final class TDZStatusModel: ObservableObject {
 
     init() {
         let defaults = UserDefaults.standard
+        Self.migrateLegacyPreferences(defaults)
         iconPreference = IconPreference(rawValue: defaults.string(forKey: "iconPreference") ?? "automatic") ?? .automatic
         manualAnimationMode = ManualAnimationMode(rawValue: defaults.string(forKey: "manualAnimationMode") ?? "automatic") ?? .automatic
         splitAccounts = defaults.bool(forKey: "splitAccounts")
         showCodexGlobalEstimate = defaults.object(forKey: "showCodexGlobalEstimate") as? Bool ?? true
+        let oldNotifications = defaults.object(forKey: "notifyOnFinish") as? Bool
+        notifyOnTaskCompletion = defaults.object(forKey: "notifyOnTaskCompletion") as? Bool ?? oldNotifications ?? true
+        notifyNearUsageLimits = defaults.object(forKey: "notifyNearUsageLimits") as? Bool ?? oldNotifications ?? true
+        launchAtLoginEnabled = TDZLaunchAtLogin.isEnabled
+        launchAtLoginMessage = nil
+        codeSleepEnabled = defaults.object(forKey: "codeSleepEnabled") as? Bool
+            ?? defaults.bool(forKey: "codeSleepArmed")
+        pauseOtherAppsEnabled = defaults.object(forKey: "pauseOtherAppsEnabled") as? Bool
+            ?? defaults.bool(forKey: "pauseOthers")
+        autoConnectPhoneHotspot = defaults.object(forKey: "autoConnectPhoneHotspot") as? Bool
+            ?? defaults.bool(forKey: "hotspotAutoConnect")
+        hotspotSSID = defaults.string(forKey: "hotspotSSID") ?? ""
         showOnboarding = !defaults.bool(forKey: "hasCompletedOnboarding")
         cookieSources = cookieSourceStore.sources()
         hasOmniRouteRefreshSession = (try? omniRouteRefreshSessionStore.cookie()) != nil
@@ -163,6 +236,11 @@ final class TDZStatusModel: ObservableObject {
     func start() {
         refreshAll()
         refreshCookieSources()
+        startHotspotNetworkMonitor()
+        updateHotspotRetryTimer()
+        if notifyOnTaskCompletion || notifyNearUsageLimits {
+            notificationCenter.requestAuthorizationIfNeeded()
+        }
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refreshAll() }
@@ -187,11 +265,167 @@ final class TDZStatusModel: ObservableObject {
         codexRefreshTimer?.invalidate()
         cookieRefreshTimer?.invalidate()
         resetForecastTimer?.invalidate()
+        hotspotRetryTimer?.invalidate()
+        hotspotRetryTimer = nil
+        if pathMonitorStarted {
+            hotspotPathMonitor.cancel()
+            pathMonitorStarted = false
+        }
+        codeSleepController.release()
+        codeSleepHolding = false
+    }
+
+    private static func migrateLegacyPreferences(_ defaults: UserDefaults) {
+        guard !defaults.bool(forKey: "settingsMigratedFromZCodeStatus") else { return }
+        let old = UserDefaults(suiteName: "com.reecedove.zcodestatus")
+        let mappings = [
+            "notifyOnFinish": "notifyOnTaskCompletion",
+            "codeSleepArmed": "codeSleepEnabled",
+            "pauseOthers": "pauseOtherAppsEnabled",
+            "hotspotAutoConnect": "autoConnectPhoneHotspot",
+            "hotspotSSID": "hotspotSSID",
+        ]
+        for (oldKey, newKey) in mappings where defaults.object(forKey: newKey) == nil {
+            if let value = old?.object(forKey: oldKey) { defaults.set(value, forKey: newKey) }
+        }
+        if defaults.object(forKey: "notifyNearUsageLimits") == nil,
+           let oldValue = old?.object(forKey: "notifyOnFinish") {
+            defaults.set(oldValue, forKey: "notifyNearUsageLimits")
+        }
+        defaults.set(true, forKey: "settingsMigratedFromZCodeStatus")
     }
 
     func finishOnboarding() {
         UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
         showOnboarding = false
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        do {
+            try TDZLaunchAtLogin.setEnabled(enabled)
+            launchAtLoginEnabled = TDZLaunchAtLogin.isEnabled
+            if TDZLaunchAtLogin.needsApproval {
+                launchAtLoginMessage = "Approve TDZStatus under System Settings → General → Login Items."
+            } else {
+                launchAtLoginMessage = nil
+            }
+        } catch {
+            launchAtLoginEnabled = TDZLaunchAtLogin.isEnabled
+            launchAtLoginMessage = error.localizedDescription
+        }
+    }
+
+    func setHotspotCredentials(ssid: String, password: String) throws {
+        let normalizedSSID = ssid.trimmingCharacters(in: .whitespacesAndNewlines)
+        try hotspotCredentialStore.save(password: password, for: normalizedSSID)
+        cachedHotspotPasswords[normalizedSSID] = password
+        hotspotSSID = normalizedSSID
+        UserDefaults.standard.set(normalizedSSID, forKey: "hotspotSSID")
+        hotspotStatusMessage = autoConnectPhoneHotspot
+            ? "Saved. TDZStatus will try to connect when macOS reports no network path."
+            : "Hotspot details saved. Turn on automatic connection when you want it."
+    }
+
+    func sendTestNotification() {
+        notificationCenter.requestAuthorizationIfNeeded { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.notificationCenter.send(
+                    title: "TDZStatus notifications are ready",
+                    body: "Task completion and usage limit alerts will appear here.",
+                    identifier: "tdzstatus-test-\(Int(Date().timeIntervalSince1970))"
+                )
+            }
+        }
+    }
+
+    private func updateCodeSleep() {
+        codeSleepController.update(
+            shouldHold: codeSleepEnabled && busyHarnessCount > 0,
+            pauseOtherApps: pauseOtherAppsEnabled
+        )
+        codeSleepHolding = codeSleepController.isHolding
+    }
+
+    private func startHotspotNetworkMonitor() {
+        guard !pathMonitorStarted else { return }
+        pathMonitorStarted = true
+        hotspotPathMonitor.pathUpdateHandler = { [weak self] path in
+            let isSatisfied = path.status == .satisfied
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.networkIsSatisfied = isSatisfied
+                if isSatisfied {
+                    self.hotspotStatusMessage = self.autoConnectPhoneHotspot
+                        ? "Internet connection is available."
+                        : "Automatic hotspot connection is off."
+                } else {
+                    self.attemptPhoneHotspotConnection()
+                }
+            }
+        }
+        hotspotPathMonitor.start(queue: hotspotMonitorQueue)
+    }
+
+    private func updateHotspotRetryTimer() {
+        if autoConnectPhoneHotspot {
+            guard hotspotRetryTimer == nil else { return }
+            let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
+                Task { @MainActor [weak self] in self?.attemptPhoneHotspotConnection() }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            hotspotRetryTimer = timer
+        } else {
+            hotspotRetryTimer?.invalidate()
+            hotspotRetryTimer = nil
+        }
+    }
+
+    private func attemptPhoneHotspotConnection() {
+        guard autoConnectPhoneHotspot else { return }
+        guard !hotspotSSID.isEmpty else {
+            hotspotStatusMessage = "Set up your hotspot name and password."
+            return
+        }
+        guard !networkIsSatisfied else { return }
+        guard !hotspotConnectInProgress,
+              Date().timeIntervalSince(lastHotspotAttempt) >= 60 else { return }
+
+        let ssid = hotspotSSID
+        let password: String
+        do {
+            if let cached = cachedHotspotPasswords[ssid] {
+                password = cached
+            } else {
+                password = try hotspotCredentialStore.password(for: ssid)
+                cachedHotspotPasswords[ssid] = password
+            }
+        } catch {
+            hotspotStatusMessage = error.localizedDescription
+            return
+        }
+
+        hotspotConnectInProgress = true
+        lastHotspotAttempt = Date()
+        hotspotStatusMessage = "Trying to connect to \(ssid)…"
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result: Result<Void, Error>
+            do {
+                try PhoneHotspotConnector.connect(ssid: ssid, password: password)
+                result = .success(())
+            } catch {
+                result = .failure(error)
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.hotspotConnectInProgress = false
+                switch result {
+                case .success:
+                    self.hotspotStatusMessage = "Connecting to \(ssid)…"
+                case .failure(let error):
+                    self.hotspotStatusMessage = error.localizedDescription
+                }
+            }
+        }
     }
 
     func refreshAll() {
@@ -206,18 +440,23 @@ final class TDZStatusModel: ObservableObject {
     }
 
     /// Refreshes linked website quotas immediately, then asks OmniRoute's local
-    /// dashboard to fetch fresh provider quota snapshots when it is connected.
+    /// dashboard to refresh its upstream provider data before reading the local snapshot.
     func refreshUsageNow() {
-        refreshAll()
+        refreshHarnesses()
+        codexConfigSummary = CodexConfigSummary.read()
+        refreshZCodeUsage()
+        refreshCodexUsage()
         refreshCookieSources()
         requestOmniRouteQuotaRefresh()
     }
 
     func refreshProviderUsage(_ provider: String, connectionID: String? = nil) {
         refreshHarnesses()
-        refreshOmniRoute()
+        if provider.caseInsensitiveCompare("codex") == .orderedSame {
+            refreshCodexUsage()
+        }
         refreshCookieSources(provider: provider, connectionID: connectionID)
-        requestOmniRouteQuotaRefresh()
+        requestOmniRouteQuotaRefresh(provider: provider, connectionID: connectionID)
     }
 
     func testAndSaveOmniRouteRefreshSession(cookie: String, completion: @escaping (Result<Void, Error>) -> Void) {
@@ -260,7 +499,10 @@ final class TDZStatusModel: ObservableObject {
             let snapshot = reader.read()
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                if let snapshot { self.zcodeUsage = snapshot }
+                if let snapshot {
+                    self.zcodeUsage = snapshot
+                    self.checkNearLimitNotifications()
+                }
                 self.zcodeReadInProgress = false
             }
         }
@@ -299,18 +541,14 @@ final class TDZStatusModel: ObservableObject {
                 let result = try reader.readAccounts()
                 DispatchQueue.main.async {
                     guard let self else { return }
-                    self.omniRouteAccounts = result.accounts
-                    self.mergeAccounts()
-                    self.omniRouteReadAt = result.readAt
-                    self.omniRouteStatus = .connected
-                    self.refreshMessage = nil
-                    self.lastRefreshAt = Date()
+                    self.applyOmniRouteRead(result)
+                    if !self.isRefreshingUsage { self.refreshMessage = nil }
                 }
             } catch {
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.omniRouteStatus = .unavailable(error.localizedDescription)
-                    self.refreshMessage = error.localizedDescription
+                    if !self.isRefreshingUsage { self.refreshMessage = error.localizedDescription }
                 }
             }
         }
@@ -328,6 +566,7 @@ final class TDZStatusModel: ObservableObject {
                 case .success(let snapshot):
                     self.codexSnapshot = snapshot
                     self.codexStatusMessage = snapshot.accountName.map { "Official limits · \($0)" } ?? "Official Codex limits"
+                    self.checkNearLimitNotifications()
                 case .failure(let error):
                     self.codexStatusMessage = error.localizedDescription
                 }
@@ -363,31 +602,147 @@ final class TDZStatusModel: ObservableObject {
         }
     }
 
-    private func requestOmniRouteQuotaRefresh() {
+    private func requestOmniRouteQuotaRefresh(provider: String? = nil, connectionID: String? = nil) {
         guard !isRefreshingUsage else { return }
         guard let cookie = try? omniRouteRefreshSessionStore.cookie() else {
-            refreshMessage = "Website quotas refreshed. Connect the OmniRoute dashboard in Settings to request a fresh OmniRoute snapshot."
+            refreshMessage = "Showing OmniRoute's latest saved data. Connect the dashboard refresh session in Settings to fetch new provider usage."
+            refreshOmniRoute()
             return
         }
+
         isRefreshingUsage = true
-        refreshMessage = "Requesting fresh provider limits from OmniRoute…"
-        omniRouteRefreshClient.refresh(cookie: cookie) { [weak self] result in
-            Task { @MainActor in
-                guard let self else { return }
-                self.isRefreshingUsage = false
-                switch result {
-                case .success:
-                    self.refreshMessage = "OmniRoute is updating provider limits…"
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-                        guard let self else { return }
-                        self.refreshOmniRoute()
-                        self.refreshCookieSources()
-                        self.refreshMessage = "Fresh usage data loaded."
+        let refreshID = UUID()
+        activeOmniRouteRefreshID = refreshID
+        refreshMessage = "Checking the current OmniRoute snapshot…"
+
+        // Establish the baseline before triggering OmniRoute. The dashboard
+        // endpoint may return before its provider fetches finish, so the UI
+        // waits for a newer SQLite snapshot instead of sleeping for a fixed delay.
+        let reader = OmniRouteReader()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let baseline = try? reader.readAccounts().accounts
+            Task { @MainActor [weak self] in
+                guard let self, self.activeOmniRouteRefreshID == refreshID else { return }
+                let baselineAccounts = baseline ?? self.omniRouteAccounts
+                self.refreshMessage = "Refreshing provider usage in OmniRoute…"
+                self.omniRouteRefreshClient.refresh(cookie: cookie) { [weak self] result in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.activeOmniRouteRefreshID == refreshID else { return }
+                        switch result {
+                        case .success:
+                            self.refreshMessage = "Waiting for OmniRoute to save fresh quota snapshots…"
+                            self.pollOmniRouteSnapshots(
+                                refreshID: refreshID,
+                                baseline: baselineAccounts,
+                                provider: provider,
+                                connectionID: connectionID,
+                                startedAt: Date(),
+                                lastChangeAt: nil,
+                                previous: baselineAccounts
+                            )
+                        case .failure(let error):
+                            self.activeOmniRouteRefreshID = nil
+                            self.isRefreshingUsage = false
+                            self.refreshMessage = error.localizedDescription
+                        }
                     }
-                case .failure(let error):
-                    self.refreshMessage = error.localizedDescription
                 }
             }
+        }
+    }
+
+    private func pollOmniRouteSnapshots(
+        refreshID: UUID,
+        baseline: [ProviderAccount],
+        provider: String?,
+        connectionID: String?,
+        startedAt: Date,
+        lastChangeAt: Date?,
+        previous: [ProviderAccount]
+    ) {
+        let reader = OmniRouteReader()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let read = Result { try reader.readAccounts() }
+            Task { @MainActor [weak self] in
+                guard let self, self.activeOmniRouteRefreshID == refreshID else { return }
+                switch read {
+                case .failure(let error):
+                    self.activeOmniRouteRefreshID = nil
+                    self.isRefreshingUsage = false
+                    self.refreshMessage = error.localizedDescription
+                case .success(let result):
+                    let now = Date()
+                    let hasNewData = Self.hasNewQuotaSnapshot(
+                        comparedWith: baseline,
+                        accounts: result.accounts,
+                        provider: provider,
+                        connectionID: connectionID
+                    )
+                    let changedSinceLastPoll = Self.hasNewQuotaSnapshot(
+                        comparedWith: previous,
+                        accounts: result.accounts,
+                        provider: provider,
+                        connectionID: connectionID
+                    )
+                    let changedAt = changedSinceLastPoll ? now : lastChangeAt
+                    self.applyOmniRouteRead(result)
+
+                    if let changedAt, now.timeIntervalSince(changedAt) >= 2.5 {
+                        self.finishOmniRouteQuotaRefresh(refreshID, freshDataLoaded: hasNewData)
+                    } else if now.timeIntervalSince(startedAt) >= 45 {
+                        self.finishOmniRouteQuotaRefresh(refreshID, freshDataLoaded: hasNewData)
+                    } else {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+                            self?.pollOmniRouteSnapshots(
+                                refreshID: refreshID,
+                                baseline: baseline,
+                                provider: provider,
+                                connectionID: connectionID,
+                                startedAt: startedAt,
+                                lastChangeAt: changedAt,
+                                previous: result.accounts
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func applyOmniRouteRead(_ result: OmniRouteReadResult) {
+        omniRouteAccounts = result.accounts
+        mergeAccounts()
+        omniRouteReadAt = result.readAt
+        omniRouteStatus = .connected
+        lastRefreshAt = Date()
+    }
+
+    private func finishOmniRouteQuotaRefresh(_ refreshID: UUID, freshDataLoaded: Bool) {
+        guard activeOmniRouteRefreshID == refreshID else { return }
+        activeOmniRouteRefreshID = nil
+        isRefreshingUsage = false
+        refreshMessage = freshDataLoaded
+            ? "Fresh OmniRoute usage data loaded."
+            : "OmniRoute accepted the refresh, but no newer quota snapshot appeared within 45 seconds. Showing its latest saved data."
+    }
+
+    private static func hasNewQuotaSnapshot(
+        comparedWith baseline: [ProviderAccount],
+        accounts: [ProviderAccount],
+        provider: String?,
+        connectionID: String?
+    ) -> Bool {
+        func selected(_ account: ProviderAccount) -> Bool {
+            (provider == nil || account.provider.caseInsensitiveCompare(provider!) == .orderedSame)
+                && (connectionID == nil || account.connectionID == connectionID!)
+        }
+        let oldWindows = Dictionary(
+            baseline.filter(selected).flatMap(\.windows).map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        return accounts.filter(selected).flatMap(\.windows).contains { window in
+            guard let old = oldWindows[window.id] else { return true }
+            return old != window
         }
     }
 
@@ -456,6 +811,7 @@ final class TDZStatusModel: ObservableObject {
             if order != .orderedSame { return order == .orderedAscending }
             return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
         }
+        checkNearLimitNotifications()
     }
 
     func finishCurrentSetup() {
@@ -487,7 +843,7 @@ final class TDZStatusModel: ObservableObject {
         let tdzCodexActivity = activityFromTDZMarkers(for: .codex)
         let tdzZcodeActivity = activityFromTDZMarkers(for: .zcode)
 
-        harnesses = HarnessKind.allCases.map { kind in
+        let nextHarnesses = HarnessKind.allCases.map { kind in
             let matches: (NSRunningApplication) -> Bool = { app in
                 let name = (app.localizedName ?? "").lowercased()
                 let bundle = (app.bundleIdentifier ?? "").lowercased()
@@ -516,6 +872,187 @@ final class TDZStatusModel: ObservableObject {
                 lastEvent: state.date
             )
         }
+
+        let previousByKind = Dictionary(uniqueKeysWithValues: harnesses.map { ($0.kind, $0) })
+        for state in nextHarnesses {
+            guard let previous = previousByKind[state.kind] else { continue }
+            if !previous.isBusy && state.isBusy {
+                captureTaskTokenBaseline(for: state.kind)
+            } else if previous.isBusy && !state.isBusy && hasInitialHarnessSnapshot {
+                notifyTaskFinished(kind: state.kind, model: previous.model ?? state.model)
+            }
+        }
+        if !hasInitialHarnessSnapshot {
+            for state in nextHarnesses where state.isBusy {
+                captureTaskTokenBaseline(for: state.kind)
+            }
+            hasInitialHarnessSnapshot = true
+        }
+        harnesses = nextHarnesses
+        updateCodeSleep()
+    }
+
+    private func captureTaskTokenBaseline(for kind: HarnessKind) {
+        guard kind == .codex else { return }
+        let requestID = UUID()
+        taskTokenReadIDs[kind] = requestID
+        taskTokenBaselines.removeValue(forKey: kind)
+        let reader = codexTokenUsageReader
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let baseline = reader.read()?.cumulativeTokens
+            Task { @MainActor [weak self] in
+                guard let self, self.taskTokenReadIDs[kind] == requestID else { return }
+                if let baseline { self.taskTokenBaselines[kind] = baseline }
+            }
+        }
+    }
+
+    private func notifyTaskFinished(kind: HarnessKind, model: String?) {
+        let baseline = taskTokenBaselines.removeValue(forKey: kind)
+        taskTokenReadIDs[kind] = nil
+        guard notifyOnTaskCompletion else { return }
+
+        if kind == .codex {
+            let reader = codexTokenUsageReader
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let usage = reader.read()
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    let tokenCount: Int64?
+                    if let baseline, let usage, usage.cumulativeTokens >= baseline,
+                       usage.cumulativeTokens > baseline {
+                        tokenCount = usage.cumulativeTokens - baseline
+                    } else if let lastTurn = usage?.latestTurnTokens, lastTurn > 0 {
+                        tokenCount = lastTurn
+                    } else {
+                        tokenCount = nil
+                    }
+                    self.deliverTaskFinished(kind: kind, model: model, tokenCount: tokenCount)
+                }
+            }
+        } else {
+            deliverTaskFinished(kind: kind, model: model, tokenCount: nil)
+        }
+    }
+
+    private func deliverTaskFinished(kind: HarnessKind, model: String?, tokenCount: Int64?) {
+        let tokenDescription = tokenCount.map { "~\(formattedTokenCount($0)) tokens" }
+            ?? "token total unavailable"
+        let usageDescription = completionUsageSummary(for: kind)
+        let modelDescription = model.flatMap { $0.isEmpty ? nil : $0 }
+        let details = [modelDescription, tokenDescription, usageDescription].compactMap { $0 }
+            .joined(separator: " · ")
+        notificationCenter.send(
+            title: "\(kind.title) task finished",
+            body: details,
+            identifier: "task-finished-\(kind.rawValue)-\(Int(Date().timeIntervalSince1970))"
+        )
+    }
+
+    private func completionUsageSummary(for kind: HarnessKind) -> String {
+        let values: [(String, Double)]
+        switch kind {
+        case .codex:
+            if let snapshot = codexSnapshot,
+               Date().timeIntervalSince(snapshot.fetchedAt) < 30 * 60 {
+                values = snapshot.windows.map { ($0.title, $0.usedPercentage) }
+            } else {
+                values = providerUsageValues(matching: { $0.isCodex })
+            }
+        case .zcode:
+            values = (zcodeUsage?.balances ?? []).compactMap { balance in
+                balance.remainingPercentage.map { (balance.model, 100 - $0) }
+            }
+        case .claude:
+            let anthropic = providerUsageValues(matching: {
+                $0.provider.localizedCaseInsensitiveContains("anthropic")
+                    || $0.provider.localizedCaseInsensitiveContains("claude")
+                    || isTokenHarborProvider($0.provider)
+            })
+            values = anthropic.isEmpty ? providerUsageValues(matching: { _ in true }) : anthropic
+        }
+        let summary = values
+            .sorted { $0.1 > $1.1 }
+            .prefix(2)
+            .map { "\($0.0) \(Int($0.1.rounded()))% used" }
+            .joined(separator: ", ")
+        return summary.isEmpty ? "usage limits unavailable" : summary
+    }
+
+    private func providerUsageValues(matching poolFilter: (ProviderPool) -> Bool) -> [(String, Double)] {
+        providerPools.filter(poolFilter).flatMap { pool in
+            pool.accounts.filter(\.isActive).flatMap { account in
+                pool.windows(for: account).compactMap { window in
+                    window.usedPercentage.map { (displayProviderName(pool.provider), $0) }
+                }
+            }
+        }
+    }
+
+    private func checkNearLimitNotifications() {
+        guard notifyNearUsageLimits else { return }
+        let now = Date()
+
+        for pool in providerPools {
+            for account in pool.accounts where account.isActive {
+                for window in pool.windows(for: account) {
+                    guard let used = window.usedPercentage,
+                          let reset = window.resetsAt,
+                          let captured = window.capturedAt,
+                          now.timeIntervalSince(captured) < 30 * 60 else { continue }
+                    notifyNearLimit(
+                        scope: window.id,
+                        title: "\(displayProviderName(pool.provider)) usage near limit",
+                        detail: "\(account.displayName) · \(displayQuotaWindowName(window.key, provider: pool.provider))",
+                        used: used,
+                        reset: reset
+                    )
+                }
+            }
+        }
+
+        if let snapshot = codexSnapshot, now.timeIntervalSince(snapshot.fetchedAt) < 30 * 60 {
+            for window in snapshot.windows {
+                guard let reset = window.resetsAt else { continue }
+                notifyNearLimit(
+                    scope: "official-codex-\(window.id)",
+                    title: "Codex usage near limit",
+                    detail: window.title,
+                    used: window.usedPercentage,
+                    reset: reset
+                )
+            }
+        }
+
+        if let snapshot = zcodeUsage,
+           let captured = snapshot.capturedAt,
+           now.timeIntervalSince(captured) < 30 * 60 {
+            for balance in snapshot.balances {
+                guard let used = balance.remainingPercentage.map({ 100 - $0 }),
+                      let reset = balance.resetsAt else { continue }
+                notifyNearLimit(
+                    scope: "zcode-\(balance.model)",
+                    title: "ZCode usage near limit",
+                    detail: balance.model,
+                    used: used,
+                    reset: reset
+                )
+            }
+        }
+    }
+
+    private func notifyNearLimit(scope: String, title: String, detail: String, used: Double, reset: Date) {
+        guard used >= 90, reset > Date() else { return }
+        let resetKey = Int(reset.timeIntervalSince1970)
+        let encodedScope = Data(scope.utf8).base64EncodedString()
+        let defaultsKey = "nearLimitNotified.\(encodedScope).\(resetKey)"
+        guard !UserDefaults.standard.bool(forKey: defaultsKey) else { return }
+        UserDefaults.standard.set(true, forKey: defaultsKey)
+        notificationCenter.send(
+            title: title,
+            body: "\(detail) · \(Int(used.rounded()))% used · resets \(reset.formatted(date: .abbreviated, time: .shortened))",
+            identifier: "near-limit-\(encodedScope)-\(resetKey)"
+        )
     }
 
     private struct MarkerState {

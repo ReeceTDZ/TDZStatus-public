@@ -60,7 +60,8 @@ struct OmniRouteReader: Sendable {
             q.is_exhausted,
             q.next_reset_at,
             q.window_duration_ms,
-            q.created_at
+            q.created_at,
+            q.id
         FROM provider_connections AS p
         LEFT JOIN (
             SELECT provider, connection_id, window_key, MAX(id) AS latest_id
@@ -106,7 +107,9 @@ struct OmniRouteReader: Sendable {
                     isExhausted: sqlite3_column_int(statement, 6) != 0,
                     resetsAt: parseQuotaDate(stringColumn(statement, 7)),
                     durationMilliseconds: duration,
-                    capturedAt: parseQuotaDate(stringColumn(statement, 9))
+                    capturedAt: parseQuotaDate(stringColumn(statement, 9)),
+                    snapshotID: sqlite3_column_type(statement, 11) == SQLITE_NULL
+                        ? nil : sqlite3_column_int64(statement, 11)
                 ))
             }
             records[accountKey] = account

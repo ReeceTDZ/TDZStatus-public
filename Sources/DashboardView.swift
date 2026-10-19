@@ -6,6 +6,7 @@ struct DashboardView: View {
     @State private var expandedProvider: String?
     @State private var showCookieEditor = false
     @State private var showOmniRouteRefreshEditor = false
+    @State private var showHotspotEditor = false
     @State private var selectedCookieAccountID: String?
 
     var body: some View {
@@ -36,6 +37,9 @@ struct DashboardView: View {
         }
         .sheet(isPresented: $showOmniRouteRefreshEditor) {
             OmniRouteRefreshEditor(model: model)
+        }
+        .sheet(isPresented: $showHotspotEditor) {
+            PhoneHotspotEditor(model: model)
         }
     }
 
@@ -207,12 +211,9 @@ struct DashboardView: View {
                 } else {
                     LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                         ForEach(model.providerPools.prefix(4)) { pool in
-                            ProviderPoolCard(pool: pool, expandedProvider: $expandedProvider, splitAccounts: model.splitAccounts, isRefreshing: model.isRefreshingUsage, configureCookie: configureCookie, refreshUsage: { provider, connectionID in model.refreshProviderUsage(provider, connectionID: connectionID) })
+                            ProviderPoolCard(pool: pool, expandedProvider: $expandedProvider, splitAccounts: model.splitAccounts, isRefreshing: model.isRefreshingUsage, configureCookie: configureCookie, refreshUsage: { provider, connectionID in model.refreshProviderUsage(provider, connectionID: connectionID) }, codexResetForecast: model.codexResetForecast, codexResetForecastError: model.codexResetForecastError, isRefreshingCodexResetForecast: model.isRefreshingCodexResetForecast, showCodexResetEstimate: model.showCodexGlobalEstimate)
                         }
                     }
-                }
-                if model.showCodexGlobalEstimate {
-                    GlobalResetEstimateCard(model: model)
                 }
             }
             ZCodeUsageCard(model: model, compact: true)
@@ -279,13 +280,9 @@ struct DashboardView: View {
             } else {
                 VStack(spacing: 10) {
                     ForEach(model.providerPools) { pool in
-                        ProviderPoolCard(pool: pool, expandedProvider: $expandedProvider, splitAccounts: model.splitAccounts, fullWidth: true, isRefreshing: model.isRefreshingUsage, configureCookie: configureCookie, refreshUsage: { provider, connectionID in model.refreshProviderUsage(provider, connectionID: connectionID) })
+                        ProviderPoolCard(pool: pool, expandedProvider: $expandedProvider, splitAccounts: model.splitAccounts, fullWidth: true, isRefreshing: model.isRefreshingUsage, configureCookie: configureCookie, refreshUsage: { provider, connectionID in model.refreshProviderUsage(provider, connectionID: connectionID) }, codexResetForecast: model.codexResetForecast, codexResetForecastError: model.codexResetForecastError, isRefreshingCodexResetForecast: model.isRefreshingCodexResetForecast, showCodexResetEstimate: model.showCodexGlobalEstimate)
                     }
                 }
-            }
-
-            if model.showCodexGlobalEstimate {
-                GlobalResetEstimateCard(model: model)
             }
 
             ZCodeUsageCard(model: model, compact: false)
@@ -328,6 +325,91 @@ struct DashboardView: View {
                     Text("Single-account providers are shown directly. Account splitting appears when a provider has multiple connected accounts.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            SettingsCard(title: "Notifications and automation", symbol: "bell.badge") {
+                VStack(alignment: .leading, spacing: 9) {
+                    Toggle("Notify when a harness finishes", isOn: $model.notifyOnTaskCompletion)
+                        .toggleStyle(.switch)
+                        .font(.system(size: 11))
+                    Toggle("Notify near usage limits", isOn: $model.notifyNearUsageLimits)
+                        .toggleStyle(.switch)
+                        .font(.system(size: 11))
+                    Text("Near-limit alerts start at 90% used. Completion alerts include the Codex turn token count when local token records are available, plus the latest available usage percentages for that harness.")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Send test notification") { model.sendTestNotification() }
+                        .buttonStyle(.bordered)
+                }
+            }
+
+            SettingsCard(title: "Work session", symbol: "moon.zzz") {
+                VStack(alignment: .leading, spacing: 9) {
+                    Toggle("Launch at Login", isOn: Binding(
+                        get: { model.launchAtLoginEnabled },
+                        set: { model.setLaunchAtLogin($0) }
+                    ))
+                    .toggleStyle(.switch)
+                    .font(.system(size: 11))
+                    if let message = model.launchAtLoginMessage {
+                        Text(message)
+                            .font(.system(size: 9))
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Divider().opacity(0.5)
+
+                    Toggle("Code Sleep", isOn: $model.codeSleepEnabled)
+                        .toggleStyle(.switch)
+                        .font(.system(size: 11))
+                    Text(model.codeSleepHolding
+                         ? "Keeping the Mac awake while a harness is working."
+                         : model.codeSleepEnabled
+                            ? "Armed. Sleep prevention starts when activity is detected."
+                            : "The Mac sleeps normally.")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Toggle("Pause Other Apps while work is active", isOn: $model.pauseOtherAppsEnabled)
+                        .toggleStyle(.switch)
+                        .font(.system(size: 11))
+                        .disabled(!model.codeSleepEnabled)
+                    Text("Other regular apps are paused only while Code Sleep is holding the Mac awake. They resume when harness activity ends or TDZStatus quits.")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            SettingsCard(title: "Phone hotspot", symbol: "wifi") {
+                VStack(alignment: .leading, spacing: 9) {
+                    Toggle("Auto-connect Phone Hotspot", isOn: $model.autoConnectPhoneHotspot)
+                        .toggleStyle(.switch)
+                        .font(.system(size: 11))
+                    HStack(spacing: 8) {
+                        Image(systemName: model.hotspotSSID.isEmpty ? "wifi.slash" : "iphone")
+                            .foregroundStyle(.secondary)
+                        Text(model.hotspotSSID.isEmpty ? "No hotspot configured" : model.hotspotSSID)
+                            .font(.system(size: 10, weight: .medium))
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                        Button(model.hotspotSSID.isEmpty ? "Set up…" : "Edit…") {
+                            showHotspotEditor = true
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    Text(model.hotspotStatusMessage)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text("When macOS reports no network path, TDZStatus retries the saved hotspot every 10 seconds. Its password is stored in macOS Keychain.")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -442,7 +524,7 @@ struct DashboardView: View {
                     Toggle("Show the staff signal estimate below provider accounts", isOn: $model.showCodexGlobalEstimate)
                         .toggleStyle(.switch)
                         .font(.system(size: 11))
-                    Text("The compact estimate appears below provider accounts. It reads codex-reset.com no more than once per minute and reflects a global forecast from public OpenAI staff signals, not an account-specific reset.")
+                    Text("The estimate appears inside the Codex provider card beneath its account list. It reads codex-reset.com no more than once per minute and reflects a global forecast from public OpenAI staff signals, not an account-specific reset.")
                         .font(.system(size: 10))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -481,6 +563,14 @@ struct DashboardView: View {
             Label("Local data", systemImage: "lock.shield")
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary)
+            if let refreshMessage = model.refreshMessage {
+                Text(refreshMessage)
+                    .font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(model.isRefreshingUsage ? Color.accentColor : Color.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .accessibilityLabel("Usage refresh status: \(refreshMessage)")
+            }
             Spacer()
             Button { model.section = .settings } label: {
                 Image(systemName: "gearshape")
@@ -562,6 +652,10 @@ private struct ProviderPoolCard: View {
     var isRefreshing = false
     var configureCookie: (ProviderAccount) -> Void
     var refreshUsage: (String, String?) -> Void
+    var codexResetForecast: CodexResetForecast? = nil
+    var codexResetForecastError: String? = nil
+    var isRefreshingCodexResetForecast = false
+    var showCodexResetEstimate = false
 
     private var isExpanded: Bool {
         !pool.isSingleAccount && expandedProvider == pool.id
@@ -600,6 +694,14 @@ private struct ProviderPoolCard: View {
                 noSnapshot
             } else {
                 usageSummary
+            }
+
+            if pool.isCodex && showCodexResetEstimate {
+                CodexResetEstimateRow(
+                    forecast: codexResetForecast,
+                    error: codexResetForecastError,
+                    isRefreshing: isRefreshingCodexResetForecast
+                )
             }
 
             if !pool.isCodex && (isExpanded || (splitAccounts && !pool.isSingleAccount && !pool.isNVIDIA)) {
@@ -1047,46 +1149,40 @@ private struct CodexWindowLine: View {
     }
 }
 
-private struct GlobalResetEstimateCard: View {
-    @ObservedObject var model: TDZStatusModel
+private struct CodexResetEstimateRow: View {
+    let forecast: CodexResetForecast?
+    let error: String?
+    let isRefreshing: Bool
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(alignment: .top, spacing: 8) {
             Image(systemName: "clock.arrow.circlepath")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(.orange)
-                .frame(width: 28, height: 28)
-                .background(.orange.opacity(0.11), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .frame(width: 20, height: 20)
+                .background(.orange.opacity(0.11), in: Circle())
 
             VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 5) {
-                    Text("Codex reset estimate · OpenAI staff")
-                        .font(.system(size: 10, weight: .semibold))
-                }
-
-                if let forecast = model.codexResetForecast {
-                    HStack(spacing: 6) {
-                        Text("24h \(forecast.probability.next24Hours)%")
-                        Text("·")
-                        Text("48h \(forecast.probability.next48Hours)%")
-                        if let window = forecast.likelyWindow {
-                            Text("·")
-                            Text("\(window) \(forecast.likelyWindowTimeZone ?? "")")
-                                .lineLimit(1)
-                        }
+                Text("OpenAI staff reset estimate")
+                    .font(.system(size: 9, weight: .semibold))
+                if let forecast {
+                    if let estimated = forecast.estimatedNextResetAt {
+                        Text(resetSummary(forecast, estimated: estimated))
+                            .font(.system(size: 8, weight: .medium, design: .rounded))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
                     }
-                    .font(.system(size: 8, weight: .medium, design: .rounded))
-                    .foregroundStyle(.secondary)
-                    Text("Global estimate · not account-specific")
+                    Text("24h \(forecast.probability.next24Hours)% · 48h \(forecast.probability.next48Hours)% · global estimate, not account-specific")
                         .font(.system(size: 7))
                         .foregroundStyle(.tertiary)
-                } else if let error = model.codexResetForecastError {
+                        .lineLimit(2)
+                } else if let error {
                     Text(error)
                         .font(.system(size: 8))
                         .foregroundStyle(.orange)
                         .lineLimit(1)
                 } else {
-                    Text(model.isRefreshingCodexResetForecast ? "Loading estimate…" : "Estimate unavailable")
+                    Text(isRefreshing ? "Loading estimate…" : "Estimate unavailable")
                         .font(.system(size: 8))
                         .foregroundStyle(.secondary)
                 }
@@ -1101,13 +1197,30 @@ private struct GlobalResetEstimateCard: View {
             }
             .help("Forecast based on public OpenAI staff signals")
         }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 9)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.orange.opacity(0.045), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 13).strokeBorder(.orange.opacity(0.12)))
         .accessibilityElement(children: .contain)
-        .help("A global estimate based on public OpenAI staff signals, not a personal account reset.")
+        .help("Estimated from public OpenAI staff signals and recent reset cadence; it is not account-specific.")
+    }
+
+    private func resetSummary(_ forecast: CodexResetForecast, estimated: Date) -> String {
+        let relative = estimated.formatted(.relative(presentation: .named))
+        let date = estimated.formatted(date: .long, time: .omitted)
+        let time: String
+        if let likelyWindow = forecast.likelyWindow, !likelyWindow.isEmpty {
+            let zone = forecast.likelyWindowTimeZone.flatMap { value -> String? in
+                guard let timeZone = TimeZone(identifier: value),
+                      timeZone.identifier != TimeZone.current.identifier else { return nil }
+                return " (\(value))"
+            } ?? ""
+            time = "\(likelyWindow)\(zone)"
+        } else {
+            time = estimated.formatted(date: .omitted, time: .shortened)
+        }
+        return "Resets \(relative) · \(date) at \(time)"
     }
 }
 
@@ -1126,6 +1239,88 @@ private struct SettingsCard<Content: View>: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 15, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 15).strokeBorder(.primary.opacity(0.055)))
+    }
+}
+
+private struct PhoneHotspotEditor: View {
+    @ObservedObject var model: TDZStatusModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var ssid: String
+    @State private var password = ""
+    @State private var errorMessage: String?
+
+    init(model: TDZStatusModel) {
+        self.model = model
+        _ssid = State(initialValue: model.hotspotSSID)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 15) {
+            HStack(spacing: 10) {
+                Image(systemName: "iphone.radiowaves.left.and.right")
+                    .font(.system(size: 20))
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Phone Hotspot")
+                        .font(.system(size: 16, weight: .bold, design: .rounded))
+                    Text("Save the hotspot network name and password for automatic reconnects.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Network name (SSID)")
+                    .font(.system(size: 11, weight: .semibold))
+                TextField("Phone hotspot name", text: $ssid)
+                    .textFieldStyle(.roundedBorder)
+                Text("Hotspot password")
+                    .font(.system(size: 11, weight: .semibold))
+                    .padding(.top, 4)
+                SecureField("Enter password", text: $password)
+                    .textFieldStyle(.roundedBorder)
+                Text("The password is saved in your macOS Keychain and is never written to app preferences.")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if let errorMessage {
+                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save Hotspot") { save() }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(ssid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || password.isEmpty)
+            }
+        }
+        .padding(18)
+        .frame(width: 430)
+    }
+
+    private func save() {
+        errorMessage = nil
+        do {
+            try model.setHotspotCredentials(ssid: ssid, password: password)
+            password = ""
+            dismiss()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 }
 

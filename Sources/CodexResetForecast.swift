@@ -12,6 +12,8 @@ struct CodexResetForecast {
     let updatedAt: Date?
     let likelyWindow: String?
     let likelyWindowTimeZone: String?
+    let estimatedNextResetAt: Date?
+    let cadenceDays: Double?
 }
 
 private struct CodexResetForecastResponse: Decodable {
@@ -30,11 +32,22 @@ private struct CodexResetForecastResponse: Decodable {
         let timezone: String?
     }
 
+    struct Cadence: Decodable {
+        let recentMedianDays: Double?
+        let weightedMeanDays: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case recentMedianDays = "recent_median_days"
+            case weightedMeanDays = "weighted_mean_days"
+        }
+    }
+
     let probabilities: Probabilities
     let confidence: String?
     let lastResetAt: String?
     let updatedAt: String?
     let timeWindow: TimeWindow?
+    let cadence: Cadence?
 
     enum CodingKeys: String, CodingKey {
         case probabilities
@@ -42,6 +55,7 @@ private struct CodexResetForecastResponse: Decodable {
         case lastResetAt = "last_reset_at"
         case updatedAt = "updated_at"
         case timeWindow = "time_window"
+        case cadence
     }
 }
 
@@ -92,16 +106,25 @@ final class CodexResetForecastFetcher {
                 return
             }
 
+            let cadenceDays = [response.cadence?.weightedMeanDays, response.cadence?.recentMedianDays]
+                .compactMap { $0 }
+                .first { $0 > 0 && $0 < 365 }
+            let lastResetAt = Self.parseDate(response.lastResetAt)
+            let estimatedNextResetAt = lastResetAt.flatMap { reset in
+                cadenceDays.map { reset.addingTimeInterval($0 * 24 * 60 * 60) }
+            }
             let forecast = CodexResetForecast(
                 probability: .init(
                     next24Hours: min(100, max(0, Int(next24.rounded()))),
                     next48Hours: min(100, max(0, Int(next48.rounded())))
                 ),
                 confidence: response.confidence,
-                lastResetAt: Self.parseDate(response.lastResetAt),
+                lastResetAt: lastResetAt,
                 updatedAt: Self.parseDate(response.updatedAt),
                 likelyWindow: response.timeWindow?.label,
-                likelyWindowTimeZone: response.timeWindow?.timezone
+                likelyWindowTimeZone: response.timeWindow?.timezone,
+                estimatedNextResetAt: estimatedNextResetAt,
+                cadenceDays: cadenceDays
             )
             completion(.success(forecast))
         }.resume()

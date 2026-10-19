@@ -11,6 +11,11 @@ xcrun swiftc -O \
   -framework SwiftUI \
   -framework ImageIO \
   -framework UserNotifications \
+  -framework CoreWLAN \
+  -framework IOKit \
+  -framework Network \
+  -framework Security \
+  -framework ServiceManagement \
   -lsqlite3 \
   Sources/*.swift \
   -o "$APP/Contents/MacOS/TDZStatus"
@@ -50,5 +55,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+
+# Give the app a stable bundle signature identifier. This keeps the app's
+# Keychain access requirement consistent across local rebuilds.
+codesign --force --deep --sign - \
+  --identifier com.reecedove.tdzstatus \
+  -r '=designated => identifier "com.reecedove.tdzstatus"' \
+  "$APP"
 
 echo "Built $APP"

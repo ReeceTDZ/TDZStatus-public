@@ -15,10 +15,17 @@ TDZStatus is a native macOS menu bar companion for ZCode, Claude, and ChatGPT Co
 - Reads the Codex config's active and declared model providers and shows which configured providers do not appear in OmniRoute.
 - Can fetch Codex Reset's public global 24-hour and 48-hour reset probabilities when enabled. It polls at most once per minute, displays a source link beside the data, and keeps that forecast separate from personal official reset windows.
 - Reuses the ZCode/Claude and Codex status animations from the existing companion projects.
+- Adds the legacy session controls: task-finished notifications, near-limit alerts, Launch at Login, Code Sleep, Pause Other Apps, and phone-hotspot auto-connect. Code Sleep holds system-sleep assertions while a harness is active; optional paused apps resume when activity ends or TDZStatus quits.
+- Includes Codex turn token totals in completion alerts when its local `token_count` records are available. The reader parses only numeric token usage fields and skips prompt, assistant, and tool records. Usage percentages are included when a recent quota snapshot is available.
+- Keeps the OpenAI staff reset estimate inside the Codex provider card, after the Codex account details, with relative and calendar estimates.
+- Makes manual refresh request fresh provider limits from the local OmniRoute dashboard, then watches the read-only SQLite snapshots for new rows before reporting the refresh complete. The local dashboard cookie is stored in Keychain and sent only to localhost.
+- Closes the menu popover when it loses app focus, including when you click into another app.
 
 The app starts with a connection screen and checks the default local OmniRoute database at `~/.omniroute/storage.sqlite`. It does not change OmniRoute data or install harness hooks. Existing CodexStatus hook markers are read if they are present. Open-app detection works without hooks; detailed thinking/tool activity requires lifecycle markers.
 
 When Codex routes through OmniRoute, TDZStatus surfaces active OmniRoute connections without quota snapshots as dashboard-cookie candidates. xKiro has a ready-to-use dashboard preset that reads its free-model daily allowance, limit, and reset. Custom sources support HTTPS endpoints with percentage or used-and-limit response fields. The cookie is stored in macOS Keychain, and the fetcher blocks redirects to a different host.
+
+Phone hotspot credentials are also stored in macOS Keychain. Automatic reconnect is attempted when macOS reports that the network path is unavailable. Notification and usage-warning preferences are independent; near-limit alerts begin at 90% usage and are sent once for each reset window.
 
 ## Build and launch
 

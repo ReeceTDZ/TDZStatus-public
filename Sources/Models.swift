@@ -70,6 +70,7 @@ struct QuotaWindow: Identifiable, Hashable {
     var durationMilliseconds: Int64?
     var resetIsEstimated = false
     var capturedAt: Date?
+    var snapshotID: Int64? = nil
 
     var id: String { "\(provider)|\(connectionID)|\(key)" }
     var usedPercentage: Double? {

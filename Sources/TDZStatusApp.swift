@@ -19,6 +19,7 @@ final class TDZStatusApp: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var currentKey: String?
     private var currentFrameIndex = 0
     private var currentFrameStartedAt = Date()
+    private var deactivationObserver: NSObjectProtocol?
 
     static func main() {
         let app = NSApplication.shared
@@ -40,6 +41,14 @@ final class TDZStatusApp: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.contentSize = NSSize(width: 640, height: 680)
         popover.delegate = self
         popover.contentViewController = NSHostingController(rootView: DashboardView(model: model))
+        deactivationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification,
+            object: NSApp,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self, self.popover.isShown else { return }
+            self.popover.performClose(nil)
+        }
 
         loadAssets()
         model.start()
@@ -60,6 +69,9 @@ final class TDZStatusApp: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         animationTimer?.invalidate()
         model.stop()
+        if let deactivationObserver {
+            NotificationCenter.default.removeObserver(deactivationObserver)
+        }
     }
 
     func popoverDidClose(_ notification: Notification) {
