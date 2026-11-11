@@ -1016,7 +1016,9 @@ private struct ProviderPoolCard: View {
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if accountWindows.isEmpty {
+            if pool.isCodex {
+                codexAccountLimits(account)
+            } else if accountWindows.isEmpty {
                 if account.windows.contains(where: pool.shows) {
                     Text("All quota meters for this account are hidden in Usage display settings.")
                         .font(.system(size: 9))
@@ -1029,8 +1031,6 @@ private struct ProviderPoolCard: View {
                         .font(.system(size: 9, weight: .semibold))
                         .buttonStyle(.link)
                 }
-            } else if pool.isCodex {
-                codexAccountLimits(account)
             } else {
                 ForEach(accountWindows) { window in
                     if let balance = window.balanceUSD {
