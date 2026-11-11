@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP="TDZStatus.app"
+APP="TDZStatus Public.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 xcrun swiftc -O \
@@ -18,12 +18,12 @@ xcrun swiftc -O \
   -framework ServiceManagement \
   -lsqlite3 \
   Sources/*.swift \
-  -o "$APP/Contents/MacOS/TDZStatus"
+  -o "$APP/Contents/MacOS/TDZStatusPublic"
 
 rm -rf "$APP/Contents/Resources/Assets"
 cp -R Assets "$APP/Contents/Resources/Assets"
 cp Resources/codex_usage_bridge.py "$APP/Contents/Resources/codex_usage_bridge.py"
-chmod 755 "$APP/Contents/MacOS/TDZStatus" "$APP/Contents/Resources/codex_usage_bridge.py"
+chmod 755 "$APP/Contents/MacOS/TDZStatusPublic" "$APP/Contents/Resources/codex_usage_bridge.py"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -31,13 +31,13 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>TDZStatus</string>
+    <string>TDZStatus Public</string>
     <key>CFBundleDisplayName</key>
-    <string>TDZStatus</string>
+    <string>TDZStatus Public</string>
     <key>CFBundleIdentifier</key>
-    <string>com.reecedove.tdzstatus</string>
+    <string>com.reecedove.tdzstatus.public</string>
     <key>CFBundleExecutable</key>
-    <string>TDZStatus</string>
+    <string>TDZStatusPublic</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -59,8 +59,8 @@ PLIST
 # Give the app a stable bundle signature identifier. This keeps the app's
 # Keychain access requirement consistent across local rebuilds.
 codesign --force --deep --sign - \
-  --identifier com.reecedove.tdzstatus \
-  -r '=designated => identifier "com.reecedove.tdzstatus"' \
+  --identifier com.reecedove.tdzstatus.public \
+  -r '=designated => identifier "com.reecedove.tdzstatus.public"' \
   "$APP"
 
 echo "Built $APP"

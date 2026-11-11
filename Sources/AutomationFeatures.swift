@@ -199,7 +199,7 @@ enum HotspotCredentialError: LocalizedError {
 }
 
 final class HotspotCredentialStore {
-    private let service = "com.reecedove.tdzstatus.phone-hotspot"
+    private let service = "com.reecedove.tdzstatus.public.phone-hotspot"
     private let legacyServices = ["ZCodeStatus Hotspot", "CodexStatus Hotspot", "ClaudeStatus Hotspot"]
 
     func save(password: String, for ssid: String) throws {
@@ -323,7 +323,7 @@ final class CodeSleepController {
     private func pauseApplications() {
         let excludedNames = ["finder", "dock", "systemuiserver", "controlcenter", "spotlight",
                              "windowserver", "loginwindow", "tdzstatus", "zcode", "claude", "codex", "chatgpt"]
-        let excludedBundlePrefixes = ["com.apple.", "com.reecedove.tdzstatus", "com.reecedove.zcodestatus",
+        let excludedBundlePrefixes = ["com.apple.", "com.reecedove.tdzstatus.public", "com.reecedove.zcodestatus",
                                       "com.anthropic.", "com.openai."]
         for app in NSWorkspace.shared.runningApplications where app.activationPolicy == .regular {
             guard let name = app.localizedName?.lowercased(),

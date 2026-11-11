@@ -22,6 +22,14 @@ final class TDZStatusModel: ObservableObject {
     @Published var section: DashboardSection = .overview
     @Published private(set) var harnesses: [HarnessState] = HarnessKind.allCases.map { HarnessState(kind: $0) }
     @Published private(set) var accounts: [ProviderAccount] = []
+    @Published private(set) var providerAccountUpdatesInProgress: Set<String> = []
+    @Published private(set) var providerAccountUpdateErrors: [String: String] = [:]
+    @Published private(set) var hiddenProviderUsageIDs: Set<String>
+    @Published private(set) var hiddenProviderIDs: Set<String>
+    @Published private(set) var paceDisabledProviderIDs: Set<String>
+    @Published var showFiveHourBudgets: Bool {
+        didSet { UserDefaults.standard.set(showFiveHourBudgets, forKey: "showFiveHourBudgets") }
+    }
     @Published private(set) var cookieSources: [CookieQuotaSource] = []
     @Published private(set) var cookieSourceErrors: [String: String] = [:]
     @Published private(set) var omniRouteStatus: OmniRouteStatus = .disconnected
@@ -109,6 +117,7 @@ final class TDZStatusModel: ObservableObject {
     private var taskTokenBaselines: [HarnessKind: Int64] = [:]
     private var taskTokenReadIDs: [HarnessKind: UUID] = [:]
     private var activeOmniRouteRefreshID: UUID?
+    private var providerAccountUpdateIDs: [String: UUID] = [:]
     private var networkIsSatisfied = true
     private var hotspotConnectInProgress = false
     private var lastHotspotAttempt = Date.distantPast
@@ -122,7 +131,7 @@ final class TDZStatusModel: ObservableObject {
     private let codeSleepController = CodeSleepController()
     private let hotspotCredentialStore = HotspotCredentialStore()
     private let hotspotPathMonitor = NWPathMonitor()
-    private let hotspotMonitorQueue = DispatchQueue(label: "com.reecedove.tdzstatus.network-monitor")
+    private let hotspotMonitorQueue = DispatchQueue(label: "com.reecedove.tdzstatus.public.network-monitor")
     private let cookieSourceStore = CookieQuotaSourceStore()
     private let cookieQuotaFetcher = CookieQuotaFetcher()
     private let omniRouteRefreshSessionStore = OmniRouteDashboardSessionStore()
@@ -134,18 +143,26 @@ final class TDZStatusModel: ObservableObject {
     private let codexStateDirectory = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".codex-status/sessions", isDirectory: true)
     private let tdzStateDirectory = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/TDZStatus/sessions", isDirectory: true)
+        .appendingPathComponent("Library/Application Support/TDZStatus Public/sessions", isDirectory: true)
 
-    var providerPools: [ProviderPool] {
-        Dictionary(grouping: accounts, by: \.provider)
+    var allProviderPools: [ProviderPool] {
+        Dictionary(grouping: accounts.filter { !isHiddenDashboardProvider($0.provider) }, by: \.provider)
             .map { ProviderPool(provider: $0.key, accounts: $0.value) }
             .sorted { $0.provider.localizedCaseInsensitiveCompare($1.provider) == .orderedAscending }
     }
 
+    var providerPools: [ProviderPool] {
+        allProviderPools.filter { !hiddenProviderIDs.contains($0.provider.lowercased()) }
+    }
+
     var accountsMissingQuota: [ProviderAccount] {
         accounts.filter {
-            $0.provider.caseInsensitiveCompare("nvidia") != .orderedSame && $0.windows.isEmpty
+            !isHiddenDashboardProvider($0.provider) && $0.windows.isEmpty
         }
+    }
+
+    var visibleCookieSources: [CookieQuotaSource] {
+        cookieSources.filter { !isHiddenDashboardProvider($0.provider) }
     }
 
     var hasMultiAccountPools: Bool {
@@ -154,7 +171,10 @@ final class TDZStatusModel: ObservableObject {
 
     var codexProvidersMissingFromOmniRoute: [String] {
         let configured = Set(codexConfigSummary.activeProviders + codexConfigSummary.declaredProviders)
-            .filter { $0.caseInsensitiveCompare("omniroute") != .orderedSame }
+            .filter {
+                $0.caseInsensitiveCompare("omniroute") != .orderedSame
+                    && !isHiddenDashboardProvider($0)
+            }
         let omniProviders = accounts.map { $0.provider.lowercased() }
         return configured.filter { provider in
             let normalized = provider.lowercased()
@@ -165,7 +185,8 @@ final class TDZStatusModel: ObservableObject {
     }
 
     var codexConfigProviderSummary: String {
-        let names = Array(Set(codexConfigSummary.activeProviders + codexConfigSummary.declaredProviders))
+        let names = Array(Set(codexConfigSummary.activeProviders + codexConfigSummary.declaredProviders)
+            .filter { !isHiddenDashboardProvider($0) })
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
         guard !names.isEmpty else { return "No model providers were found in this Codex config." }
         if names.count == 1, names[0].caseInsensitiveCompare("omniroute") == .orderedSame {
@@ -210,6 +231,17 @@ final class TDZStatusModel: ObservableObject {
     init() {
         let defaults = UserDefaults.standard
         Self.migrateLegacyPreferences(defaults)
+        let oldHiddenUsageIDs = Set(defaults.stringArray(forKey: "hiddenProviderUsageIDs") ?? [])
+        hiddenProviderUsageIDs = oldHiddenUsageIDs
+        var hiddenProviders = Set(defaults.stringArray(forKey: "hiddenProviderIDs") ?? [])
+        if !defaults.bool(forKey: "providerVisibilityMigrated") {
+            hiddenProviders.formUnion(oldHiddenUsageIDs.compactMap { $0.split(separator: "|", maxSplits: 1).first.map(String.init) })
+            defaults.set(hiddenProviders.sorted(), forKey: "hiddenProviderIDs")
+            defaults.set(true, forKey: "providerVisibilityMigrated")
+        }
+        hiddenProviderIDs = hiddenProviders
+        paceDisabledProviderIDs = Set(defaults.stringArray(forKey: "paceDisabledProviderIDs") ?? [])
+        showFiveHourBudgets = defaults.object(forKey: "showFiveHourBudgets") as? Bool ?? true
         iconPreference = IconPreference(rawValue: defaults.string(forKey: "iconPreference") ?? "automatic") ?? .automatic
         manualAnimationMode = ManualAnimationMode(rawValue: defaults.string(forKey: "manualAnimationMode") ?? "automatic") ?? .automatic
         splitAccounts = defaults.bool(forKey: "splitAccounts")
@@ -298,6 +330,28 @@ final class TDZStatusModel: ObservableObject {
     func finishOnboarding() {
         UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
         showOnboarding = false
+    }
+
+    func setProviderUsageVisible(provider: String, key: String, isVisible: Bool) {
+        let usageID = providerUsageVisibilityID(provider, key)
+        if isVisible {
+            hiddenProviderUsageIDs.remove(usageID)
+        } else {
+            hiddenProviderUsageIDs.insert(usageID)
+        }
+        UserDefaults.standard.set(hiddenProviderUsageIDs.sorted(), forKey: "hiddenProviderUsageIDs")
+    }
+
+    func setProviderVisible(_ provider: String, isVisible: Bool) {
+        if isVisible { hiddenProviderIDs.remove(provider.lowercased()) }
+        else { hiddenProviderIDs.insert(provider.lowercased()) }
+        UserDefaults.standard.set(hiddenProviderIDs.sorted(), forKey: "hiddenProviderIDs")
+    }
+
+    func setPaceVisible(_ provider: String, isVisible: Bool) {
+        if isVisible { paceDisabledProviderIDs.remove(provider.lowercased()) }
+        else { paceDisabledProviderIDs.insert(provider.lowercased()) }
+        UserDefaults.standard.set(paceDisabledProviderIDs.sorted(), forKey: "paceDisabledProviderIDs")
     }
 
     func setLaunchAtLogin(_ enabled: Bool) {
@@ -459,6 +513,52 @@ final class TDZStatusModel: ObservableObject {
         requestOmniRouteQuotaRefresh(provider: provider, connectionID: connectionID)
     }
 
+    func setProviderAccountActive(_ account: ProviderAccount, isActive: Bool) {
+        guard account.isActive != isActive,
+              !providerAccountUpdatesInProgress.contains(account.id) else { return }
+        providerAccountUpdateErrors.removeValue(forKey: account.id)
+
+        let cookie: String
+        do {
+            cookie = try omniRouteRefreshSessionStore.cookie()
+            hasOmniRouteRefreshSession = true
+        } catch {
+            // The dashboard session can be removed or expire while the app is
+            // open. Don't leave an apparently live switch enabled on a stale
+            // in-memory Keychain check.
+            hasOmniRouteRefreshSession = false
+            providerAccountUpdateErrors[account.id] = "OmniRoute dashboard session is unavailable. Reconnect it in Settings."
+            return
+        }
+
+        let operationID = UUID()
+        providerAccountUpdateIDs[account.id] = operationID
+        providerAccountUpdatesInProgress.insert(account.id)
+        omniRouteRefreshClient.setAccountActive(
+            connectionID: account.connectionID,
+            isActive: isActive,
+            cookie: cookie
+        ) { [weak self] result in
+            Task { @MainActor [weak self] in
+                guard let self, self.providerAccountUpdateIDs[account.id] == operationID else { return }
+                switch result {
+                case .success:
+                    self.confirmProviderAccountStatus(
+                        account,
+                        isActive: isActive,
+                        operationID: operationID,
+                        attemptsRemaining: 10
+                    )
+                case .failure(let error):
+                    if (error as? OmniRouteRefreshError)?.isAuthenticationFailure == true {
+                        self.hasOmniRouteRefreshSession = false
+                    }
+                    self.finishProviderAccountUpdate(account.id, operationID: operationID, error: error.localizedDescription)
+                }
+            }
+        }
+    }
+
     func testAndSaveOmniRouteRefreshSession(cookie: String, completion: @escaping (Result<Void, Error>) -> Void) {
         let normalized: String
         do {
@@ -576,7 +676,8 @@ final class TDZStatusModel: ObservableObject {
 
     func refreshCookieSources(provider: String? = nil, connectionID: String? = nil) {
         cookieSources = cookieSourceStore.sources()
-        for source in cookieSources where !cookieRequestsInProgress.contains(source.id)
+        for source in cookieSources where !isHiddenDashboardProvider(source.provider)
+            && !cookieRequestsInProgress.contains(source.id)
             && (provider == nil || source.provider.caseInsensitiveCompare(provider!) == .orderedSame)
             && (connectionID == nil || source.connectionID == connectionID!) {
             do {
@@ -717,6 +818,60 @@ final class TDZStatusModel: ObservableObject {
         lastRefreshAt = Date()
     }
 
+    private func confirmProviderAccountStatus(
+        _ account: ProviderAccount,
+        isActive: Bool,
+        operationID: UUID,
+        attemptsRemaining: Int
+    ) {
+        let reader = OmniRouteReader()
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let read = Result { try reader.readAccounts() }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.providerAccountUpdateIDs[account.id] == operationID else { return }
+                switch read {
+                case .failure(let error):
+                    self.finishProviderAccountUpdate(account.id, operationID: operationID, error: error.localizedDescription)
+                case .success(let result):
+                    self.applyOmniRouteRead(result)
+                    let updatedAccount = result.accounts.first {
+                        $0.connectionID == account.connectionID
+                            && $0.provider.caseInsensitiveCompare(account.provider) == .orderedSame
+                    }
+                    if updatedAccount?.isActive == isActive {
+                        self.finishProviderAccountUpdate(account.id, operationID: operationID, error: nil)
+                    } else if attemptsRemaining > 0 {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                            self?.confirmProviderAccountStatus(
+                                account,
+                                isActive: isActive,
+                                operationID: operationID,
+                                attemptsRemaining: attemptsRemaining - 1
+                            )
+                        }
+                    } else {
+                        self.finishProviderAccountUpdate(
+                            account.id,
+                            operationID: operationID,
+                            error: "OmniRoute accepted the change, but its local account status has not updated yet."
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func finishProviderAccountUpdate(_ accountID: String, operationID: UUID, error: String?) {
+        guard providerAccountUpdateIDs[accountID] == operationID else { return }
+        providerAccountUpdateIDs.removeValue(forKey: accountID)
+        providerAccountUpdatesInProgress.remove(accountID)
+        if let error {
+            providerAccountUpdateErrors[accountID] = error
+        } else {
+            providerAccountUpdateErrors.removeValue(forKey: accountID)
+        }
+    }
+
     private func finishOmniRouteQuotaRefresh(_ refreshID: UUID, freshDataLoaded: Bool) {
         guard activeOmniRouteRefreshID == refreshID else { return }
         activeOmniRouteRefreshID = nil
@@ -751,6 +906,10 @@ final class TDZStatusModel: ObservableObject {
         cookie: String,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
+        guard !isHiddenDashboardProvider(source.provider) else {
+            completion(.failure(CookieQuotaError.monitoringRemoved))
+            return
+        }
         let cookieHeader: String
         do {
             cookieHeader = try CookieQuotaFetcher.normalizedCookieHeader(cookie, provider: source.provider)
@@ -790,6 +949,7 @@ final class TDZStatusModel: ObservableObject {
     private func mergeAccounts() {
         var merged = omniRouteAccounts
         for source in cookieSources {
+            guard !isHiddenDashboardProvider(source.provider) else { continue }
             guard let window = cookieWindows[source.id] else { continue }
             if let index = merged.firstIndex(where: {
                 $0.provider == source.provider && $0.connectionID == source.connectionID
@@ -980,7 +1140,7 @@ final class TDZStatusModel: ObservableObject {
     }
 
     private func providerUsageValues(matching poolFilter: (ProviderPool) -> Bool) -> [(String, Double)] {
-        providerPools.filter(poolFilter).flatMap { pool in
+        allProviderPools.filter(poolFilter).flatMap { pool in
             pool.accounts.filter(\.isActive).flatMap { account in
                 pool.windows(for: account).compactMap { window in
                     window.usedPercentage.map { (displayProviderName(pool.provider), $0) }
@@ -993,7 +1153,7 @@ final class TDZStatusModel: ObservableObject {
         guard notifyNearUsageLimits else { return }
         let now = Date()
 
-        for pool in providerPools {
+        for pool in allProviderPools {
             for account in pool.accounts where account.isActive {
                 for window in pool.windows(for: account) {
                     guard let used = window.usedPercentage,

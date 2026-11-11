@@ -7,6 +7,7 @@ enum OmniRouteRefreshError: LocalizedError {
     case missingDashboardCookie
     case invalidCSRFResponse
     case httpStatus(Int)
+    case accountUpdateFailed(Int)
     case keychain(String)
 
     var errorDescription: String? {
@@ -15,8 +16,22 @@ enum OmniRouteRefreshError: LocalizedError {
         case .invalidCookieHeader: "Paste a Cookie-Editor header in name=value; name=value format."
         case .missingDashboardCookie: "The header must include OmniRoute's auth_token cookie."
         case .invalidCSRFResponse: "OmniRoute did not return a dashboard refresh token."
-        case .httpStatus(let code): "OmniRoute returned HTTP \(code) while refreshing quota data."
-        case .keychain(let reason): "Couldn't store the OmniRoute dashboard cookie: \(reason)"
+        case .httpStatus(let code) where code == 401 || code == 403:
+            "OmniRoute rejected the dashboard session (HTTP \(code)). Reconnect it in Settings."
+        case .httpStatus(let code): "OmniRoute dashboard request failed (HTTP \(code))."
+        case .accountUpdateFailed(let code) where code == 401 || code == 403:
+            "OmniRoute rejected the dashboard session (HTTP \(code)). Reconnect it in Settings."
+        case .accountUpdateFailed(let code) where code == 404:
+            "OmniRoute couldn't find this provider account (HTTP 404). Refresh the provider list and try again."
+        case .accountUpdateFailed(let code): "OmniRoute rejected the account status change (HTTP \(code))."
+        case .keychain(let reason): "Couldn't access the OmniRoute dashboard session in Keychain: \(reason)"
+        }
+    }
+
+    var isAuthenticationFailure: Bool {
+        switch self {
+        case .httpStatus(401), .httpStatus(403), .accountUpdateFailed(401), .accountUpdateFailed(403): true
+        default: false
         }
     }
 }
@@ -24,7 +39,7 @@ enum OmniRouteRefreshError: LocalizedError {
 /// Stores only the local OmniRoute dashboard session cookie. TDZStatus uses it
 /// only against localhost to ask OmniRoute to refresh its own provider limits.
 final class OmniRouteDashboardSessionStore {
-    private let service = "com.reecedove.tdzstatus.omniroute-dashboard"
+    private let service = "com.reecedove.tdzstatus.public.omniroute-dashboard"
     private let account = "auth_token"
 
     func cookie() throws -> String {
@@ -126,6 +141,48 @@ struct OmniRouteRefreshClient {
                     let code = (response as? HTTPURLResponse)?.statusCode ?? 0
                     guard (200..<300).contains(code) else {
                         completion(.failure(OmniRouteRefreshError.httpStatus(code)))
+                        return
+                    }
+                    completion(.success(()))
+                }.resume()
+            }
+        }
+    }
+
+    /// Changes a provider connection through OmniRoute's dashboard API. The
+    /// local SQLite database remains read-only to TDZStatus; OmniRoute owns the
+    /// account state and persists the change itself.
+    func setAccountActive(
+        connectionID: String,
+        isActive: Bool,
+        cookie: String,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        csrfToken(cookie: cookie) { result in
+            switch result {
+            case .failure(let error): completion(.failure(error))
+            case .success(let csrf):
+                let allowedPathCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+                let encodedID = connectionID.addingPercentEncoding(withAllowedCharacters: allowedPathCharacters) ?? connectionID
+                guard let url = URL(string: "/api/providers/\(encodedID)", relativeTo: self.baseURL)?.absoluteURL else {
+                    completion(.failure(OmniRouteRefreshError.accountUpdateFailed(0)))
+                    return
+                }
+
+                var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 20)
+                request.httpMethod = "PUT"
+                request.setValue(cookie, forHTTPHeaderField: "Cookie")
+                request.setValue(csrf, forHTTPHeaderField: "x-omniroute-csrf")
+                request.setValue("application/json", forHTTPHeaderField: "Accept")
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.setValue("TDZStatus/0.1.0", forHTTPHeaderField: "User-Agent")
+                request.httpBody = try? JSONSerialization.data(withJSONObject: ["isActive": isActive])
+
+                self.session.dataTask(with: request) { _, response, error in
+                    if let error { completion(.failure(error)); return }
+                    let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    guard (200..<300).contains(code) else {
+                        completion(.failure(OmniRouteRefreshError.accountUpdateFailed(code)))
                         return
                     }
                     completion(.success(()))

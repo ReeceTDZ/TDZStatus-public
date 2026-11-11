@@ -71,10 +71,42 @@ struct QuotaWindow: Identifiable, Hashable {
     var resetIsEstimated = false
     var capturedAt: Date?
     var snapshotID: Int64? = nil
+    var priorRemaining: Double? = nil
+    var priorCapturedAt: Date? = nil
+    var weekPriorRemaining: Double? = nil
+    var weekPriorCapturedAt: Date? = nil
+    var balanceUSD: Double? = nil
+    var consumedUSD: Double? = nil
 
     var id: String { "\(provider)|\(connectionID)|\(key)" }
     var usedPercentage: Double? {
         remainingPercentage.map { min(100, max(0, 100 - $0)) }
+    }
+
+    var isFiveHourWindow: Bool {
+        if let durationMilliseconds { return (17_000_000...19_000_000).contains(durationMilliseconds) }
+        let name = key.lowercased()
+        if name.contains("5h") || name.contains("five_hour") || name.contains("5_hour") { return true }
+        if name == "session", let reset = resetsAt, let captured = capturedAt {
+            return reset > captured && reset.timeIntervalSince(captured) <= 18_000
+        }
+        return false
+    }
+
+    func projectedExhaustion(now: Date = Date()) -> Date? {
+        guard let remainingPercentage, let old = priorRemaining,
+              let start = priorCapturedAt, let end = capturedAt,
+              end.timeIntervalSince(start) >= 1800, now.timeIntervalSince(end) < 21600,
+              old > remainingPercentage, let reset = resetsAt, reset > now else { return nil }
+        let rate = (old - remainingPercentage) / end.timeIntervalSince(start)
+        return end.addingTimeInterval(remainingPercentage / rate)
+    }
+
+    var supportsPacePrediction: Bool {
+        guard !isFiveHourWindow, remainingPercentage != nil, let reset = resetsAt, let captured = capturedAt else { return false }
+        let name = key.lowercased()
+        return name.contains("week") || name.contains("month") || name == "unknown_primary"
+            || (durationMilliseconds ?? 0) >= 86_400_000 || reset.timeIntervalSince(captured) > 86_400
     }
 }
 
@@ -84,31 +116,107 @@ struct ProviderAccount: Identifiable {
     var displayName: String
     var isActive: Bool
     var windows: [QuotaWindow]
+    var planName: String? = nil
+
+    var isPaidPlan: Bool {
+        guard let plan = planName?.lowercased(), !plan.isEmpty else { return false }
+        return !["free", "unknown", "none"].contains(plan)
+    }
 
     var id: String { "\(provider)|\(connectionID)" }
     var hasUsage: Bool { !windows.isEmpty }
     var latestCapture: Date? { windows.compactMap(\.capturedAt).max() }
+
+    /// The longest reported window represents the account's primary pool.
+    var codexPrimary: QuotaWindow? {
+        windows.filter { !$0.isFiveHourWindow && $0.remainingPercentage != nil }
+            .max { ($0.resetsAt ?? .distantPast) < ($1.resetsAt ?? .distantPast) }
+    }
+
+    var codexSession: QuotaWindow? { windows.first(where: \.isFiveHourWindow) }
+    var codexWeekly: QuotaWindow? {
+        windows.first { $0.key.lowercased().contains("week") && !$0.isFiveHourWindow }
+    }
+
+    /// A rolling usage budget inferred from snapshots and time until the
+    /// provider's real reset. It is never presented as an official limit.
+    func estimatedBudget(period: TimeInterval, now: Date = Date()) -> Double? {
+        guard let source = codexPrimary, let current = source.remainingPercentage,
+              let captured = source.capturedAt, let reset = source.resetsAt,
+              now.timeIntervalSince(captured) >= -60, now.timeIntervalSince(captured) < 6 * 3600,
+              reset > now else { return nil }
+        let baseline = period <= 18_000 ? source.priorRemaining : source.weekPriorRemaining
+        let baselineDate = period <= 18_000 ? source.priorCapturedAt : source.weekPriorCapturedAt
+        guard let baseline, let baselineDate, baseline >= current,
+              captured.timeIntervalSince(baselineDate) >= (period <= 18_000 ? 4.5 * 3600 : 6 * 86400) else { return nil }
+        let spent = baseline - current
+        let fairRemaining = min(current, current * period / reset.timeIntervalSince(now))
+        let budget = spent + fairRemaining
+        guard budget > 0 else { return 0 }
+        return max(0, min(100, 100 * fairRemaining / budget))
+    }
+
+    var paceWindows: [QuotaWindow] { windows.filter(\.supportsPacePrediction) }
+
+    func paceAssessment(now: Date = Date()) -> (window: QuotaWindow, exhaustedAt: Date)? {
+        paceWindows.compactMap { window -> (window: QuotaWindow, exhaustedAt: Date)? in
+            guard let reset = window.resetsAt, let projected = window.projectedExhaustion(now: now), projected < reset else { return nil }
+            return (window, projected)
+        }.min { $0.exhaustedAt < $1.exhaustedAt }
+    }
 }
 
 struct ProviderPool: Identifiable {
     var provider: String
     var accounts: [ProviderAccount]
+    var hiddenUsageIDs: Set<String> = []
 
     var id: String { provider }
     var windows: [QuotaWindow] { accounts.flatMap(\.windows) }
+    var activeAccounts: [ProviderAccount] { accounts.filter(\.isActive) }
+    var activeWindows: [QuotaWindow] { activeAccounts.flatMap(\.windows) }
     var accountCount: Int { accounts.count }
+    var activeAccountCount: Int { activeAccounts.count }
+    var disabledAccountCount: Int { accountCount - activeAccountCount }
+    /// Number of accounts with saved quota data, including disabled accounts.
     var accountsWithUsage: Int { accounts.filter(\.hasUsage).count }
     var isSingleAccount: Bool { accountCount == 1 }
-    var isNVIDIA: Bool { provider.caseInsensitiveCompare("nvidia") == .orderedSame }
     var isAntigravity: Bool { provider.caseInsensitiveCompare("antigravity") == .orderedSame }
     var isGitHubCopilot: Bool { provider.caseInsensitiveCompare("github") == .orderedSame }
     var isCodex: Bool { provider.caseInsensitiveCompare("codex") == .orderedSame }
+
+    var codexPrimaryWindows: [QuotaWindow] { accounts.compactMap(\.codexPrimary) }
+
+    func codexFiveHourValues() -> [Double] {
+        accounts.compactMap { $0.codexSession?.remainingPercentage ?? $0.estimatedBudget(period: 18_000) }
+    }
+
+    func codexWeeklyValues() -> [Double] {
+        accounts.compactMap { account in
+            if account.isPaidPlan { return account.codexWeekly?.remainingPercentage }
+            return account.estimatedBudget(period: 604_800)
+        }
+    }
+
+    var sortedAccounts: [ProviderAccount] {
+        accounts.sorted {
+            if isCodex && $0.isPaidPlan != $1.isPaidPlan { return $0.isPaidPlan }
+            return $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending
+        }
+    }
+
+    func usageID(for key: String) -> String {
+        providerUsageVisibilityID(provider, key)
+    }
+
+    func showsInApp(_ window: QuotaWindow) -> Bool {
+        shows(window) && !hiddenUsageIDs.contains(usageID(for: window.key))
+    }
 
     /// Some integrations publish individual model entries even though their
     /// consumption is charged against one shared window. Only show windows
     /// that represent independently meaningful limits.
     func shows(_ window: QuotaWindow) -> Bool {
-        if isNVIDIA { return false }
         if isAntigravity {
             return ["gemini_weekly", "claude_gpt_weekly"].contains(window.key)
         }
@@ -124,19 +232,23 @@ struct ProviderPool: Identifiable {
         return true
     }
 
-    var windowKeys: [String] {
+    var allWindowKeys: [String] {
         Array(Set(windows.filter(shows).map(\.key))).sorted { lhs, rhs in
             displayQuotaWindowName(lhs, provider: provider)
                 .localizedCaseInsensitiveCompare(displayQuotaWindowName(rhs, provider: provider)) == .orderedAscending
         }
     }
 
+    var windowKeys: [String] {
+        allWindowKeys.filter { !hiddenUsageIDs.contains(usageID(for: $0)) }
+    }
+
     func accounts(for key: String) -> [QuotaWindow] {
-        windows.filter { $0.key == key && shows($0) }
+        windows.filter { $0.key == key && showsInApp($0) }
     }
 
     func windows(for account: ProviderAccount) -> [QuotaWindow] {
-        account.windows.filter(shows).sorted {
+        account.windows.filter(showsInApp).sorted {
             displayQuotaWindowName($0.key, provider: provider)
                 .localizedCaseInsensitiveCompare(displayQuotaWindowName($1.key, provider: provider)) == .orderedAscending
         }
@@ -160,7 +272,28 @@ struct ProviderPool: Identifiable {
     }
 }
 
+func providerUsageVisibilityID(_ provider: String, _ key: String) -> String {
+    "\(provider.lowercased())|\(key.lowercased())"
+}
+
+func isHiddenDashboardProvider(_ provider: String) -> Bool {
+    let normalized = provider.lowercased()
+    return normalized == "cline"
+        || normalized.hasPrefix("cline-")
+        || normalized == "nvidia"
+        || normalized.hasPrefix("nvidia-")
+        || normalized == "xkiro"
+        || normalized.hasPrefix("xkiro ")
+        || normalized.hasPrefix("xkiro-")
+        || normalized == "kiro"
+        || normalized.hasPrefix("kiro ")
+        || normalized.hasPrefix("kiro-")
+        || normalized.hasPrefix("codecraft")
+        || isCodeCraftProvider(provider)
+}
+
 func displayQuotaWindowName(_ key: String, provider: String) -> String {
+    if key.lowercased() == "unknown_primary" { return "Primary limit" }
     if provider.caseInsensitiveCompare("antigravity") == .orderedSame {
         switch key {
         case "gemini_weekly": return "Gemini · weekly"
@@ -251,8 +384,6 @@ enum DashboardSection: String, CaseIterable, Identifiable {
 
 func displayProviderName(_ provider: String) -> String {
     let identifier = provider.lowercased()
-    if identifier == "codecraft" { return "CodeCraft API" }
-    if identifier == "tokenharbor" { return "Token Harbor" }
     if identifier.hasPrefix("anthropic-compatible") { return "Anthropic Compatible" }
     if identifier.hasPrefix("openai-compatible-chat") { return "OpenAI Compatible" }
     switch identifier {
@@ -274,11 +405,11 @@ func displayProviderName(_ provider: String) -> String {
 }
 
 func isCodeCraftProvider(_ provider: String?) -> Bool {
-    provider?.caseInsensitiveCompare("codecraft") == .orderedSame
+    provider?.lowercased().contains("codecraft") == true
 }
 
 func isTokenHarborProvider(_ provider: String?) -> Bool {
-    provider?.caseInsensitiveCompare("tokenharbor") == .orderedSame
+    provider?.lowercased().contains("tokenharbor") == true || provider?.lowercased().contains("token-harbor") == true
 }
 
 func parseQuotaDate(_ value: String?) -> Date? {

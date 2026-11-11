@@ -2,25 +2,22 @@ import SwiftUI
 
 private enum CookieQuotaPreset: String, CaseIterable, Identifiable {
     case custom
-    case xkiro
-    case codeCraft
     case tokenHarbor
+    case agentRouter
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .custom: "Custom endpoint"
-        case .xkiro: "xKiro · Free models daily allowance"
-        case .codeCraft: "CodeCraft API · Monthly plan allowance"
         case .tokenHarbor: "Token Harbor · Free allowance"
+        case .agentRouter: "AgentRouter · Wallet balance"
         }
     }
 
     static func suggested(for provider: String?) -> CookieQuotaPreset {
-        if provider?.caseInsensitiveCompare("xkiro") == .orderedSame { return .xkiro }
-        if isCodeCraftProvider(provider) { return .codeCraft }
         if isTokenHarborProvider(provider) { return .tokenHarbor }
+        if provider?.lowercased() == "agentrouter" { return .agentRouter }
         return .custom
     }
 
@@ -36,28 +33,8 @@ private enum CookieQuotaPreset: String, CaseIterable, Identifiable {
     )? {
         switch self {
         case .custom: nil
-        case .xkiro:
-            (
-                endpoint: "https://xkiro.com/api/v1/me/subscription",
-                windowKey: "Free models · daily",
-                valueField: "data.freeQuota.usedToday",
-                limitField: "data.freeQuota.cap",
-                resetField: "data.freeQuota.resetAt",
-                durationField: "",
-                valueMode: .usedOfLimit,
-                responseFormat: .json
-            )
-        case .codeCraft:
-            (
-                endpoint: "https://codecraftapi.com/dashboard/billing/plan",
-                windowKey: "Monthly plan allowance",
-                valueField: "",
-                limitField: "",
-                resetField: "",
-                durationField: "",
-                valueMode: .remainingPercentage,
-                responseFormat: .codeCraftPlanHTML
-            )
+        case .agentRouter:
+            (endpoint: "https://agentrouter.org/api/user/self", windowKey: "Wallet credit", valueField: "", limitField: "", resetField: "", durationField: "", valueMode: .remainingPercentage, responseFormat: .agentRouter)
         case .tokenHarbor:
             (
                 endpoint: "https://tokenharbor.ai/api/me/free-tier",
@@ -89,12 +66,15 @@ struct CookieSourceEditor: View {
     @State private var durationField: String
     @State private var valueMode: CookieQuotaValueMode
     @State private var responseFormat: CookieQuotaResponseFormat
+    @State private var dashboardUserID = ""
     @State private var isSaving = false
     @State private var errorMessage: String?
 
     init(model: TDZStatusModel, initialAccountID: String? = nil) {
         self.model = model
-        let initialAccount = model.accounts.first { $0.id == initialAccountID }
+        let initialAccount = model.accounts.first {
+            $0.id == initialAccountID && !isHiddenDashboardProvider($0.provider)
+        }
         let initialPreset = CookieQuotaPreset.suggested(for: initialAccount?.provider)
         let configuration = initialPreset.configuration
         _selectedAccountID = State(initialValue: initialAccount?.id ?? "__custom__")
@@ -138,7 +118,7 @@ struct CookieSourceEditor: View {
             Form {
                 Section("Account") {
                     Picker("Provider account", selection: $selectedAccountID) {
-                        ForEach(model.accounts) { account in
+                        ForEach(model.accounts.filter { !isHiddenDashboardProvider($0.provider) }) { account in
                             Text("\(displayProviderName(account.provider)) · \(account.displayName)").tag(account.id)
                         }
                         Text("New provider account").tag("__custom__")
@@ -161,7 +141,7 @@ struct CookieSourceEditor: View {
                     TextField("HTTPS endpoint", text: $endpoint, prompt: Text("https://provider.example/api/usage"))
                     TextField("Window label", text: $windowKey)
                     Picker("Response format", selection: $responseFormat) {
-                        ForEach(CookieQuotaResponseFormat.allCases) { format in
+                        ForEach(CookieQuotaResponseFormat.allCases.filter { $0 != .codeCraftPlanHTML }) { format in
                             Text(format.title).tag(format)
                         }
                     }
@@ -177,26 +157,19 @@ struct CookieSourceEditor: View {
                         }
                         TextField("Reset timestamp field", text: $resetField, prompt: Text("data.usage.resets_at"))
                         TextField("Window duration in minutes field", text: $durationField, prompt: Text("Optional"))
-                    } else {
-                        Text("CodeCraft’s authenticated plan page supplies its monthly allowance. TDZStatus estimates the reset as the next calendar month.")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                    } else if responseFormat == .agentRouter {
+                        TextField("AgentRouter user ID", text: $dashboardUserID)
+                        Text("Enter your AgentRouter numeric user ID and the session cookie from the logged-in dashboard.")
+                            .font(.system(size: 9)).foregroundStyle(.secondary)
                     }
-                    Text("xKiro and Token Harbor use their dashboard JSON endpoints. Custom JSON sources support dot paths or JSON Pointer paths. Reset values may be ISO dates or Unix timestamps.")
+                    Text("Token Harbor uses its dashboard JSON endpoint. Custom JSON sources support dot paths or JSON Pointer paths. Reset values may be ISO dates or Unix timestamps.")
                         .font(.system(size: 9))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
 
                 Section("Website cookie") {
-                    SecureField("Cookie-Editor header", text: $cookie, prompt: Text("__xt_at=…; __xt_rt=…; __xt_user=…; xtrouter_theme=dark"))
-                    if selectedAccount?.provider.caseInsensitiveCompare("xkiro") == .orderedSame {
-                        Text("Paste Cookie-Editor’s full semicolon-separated header. TDZStatus keeps xKiro’s __xt_at, __xt_rt, and __xt_user cookies and drops theme and analytics cookies.")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+                    SecureField("Cookie-Editor header", text: $cookie, prompt: Text("session=…; other_cookie=…"))
                     Text("The cookie is sent only to this provider endpoint and is stored in macOS Keychain after a successful test.")
                         .font(.system(size: 9))
                         .foregroundStyle(.secondary)
@@ -281,6 +254,7 @@ struct CookieSourceEditor: View {
             valueMode: valueMode,
             limitField: usesAmountLimit ? limitField.trimmingCharacters(in: .whitespacesAndNewlines) : nil,
             responseFormat: responseFormat,
+            dashboardUserID: responseFormat == .agentRouter ? dashboardUserID.trimmingCharacters(in: .whitespacesAndNewlines) : nil,
             updatedAt: Date()
         )
         model.testAndSaveCookieSource(source, cookie: cookie) { result in

@@ -45,8 +45,8 @@ struct OmniRouteReader: Sendable {
         defer { sqlite3_close(database) }
 
         // This intentionally selects only public account labels and quota fields.
-        // Disabled Codex connections remain useful for account-by-account usage
-        // history, so include them while keeping other disabled providers out.
+        // Include inactive connections for every provider so they can be enabled
+        // from the app and their last saved usage remains available by account.
         // Credential columns (API keys, access/refresh tokens, cookies, ID tokens,
         // provider-specific data) are never read by TDZStatus.
         let sql = """
@@ -61,7 +61,28 @@ struct OmniRouteReader: Sendable {
             q.next_reset_at,
             q.window_duration_ms,
             q.created_at,
-            q.id
+            q.id,
+            CASE WHEN json_valid(p.provider_specific_data) THEN json_extract(p.provider_specific_data, '$.workspacePlanType') END,
+            (SELECT h.remaining_percentage FROM quota_snapshots h
+             WHERE h.provider = q.provider AND h.connection_id = q.connection_id AND h.window_key = q.window_key
+               AND h.next_reset_at = q.next_reset_at AND datetime(h.created_at) < datetime(q.created_at, '-30 minutes')
+               AND datetime(h.created_at) >= datetime(q.created_at, '-5 hours')
+             ORDER BY h.created_at ASC LIMIT 1),
+            (SELECT h.created_at FROM quota_snapshots h
+             WHERE h.provider = q.provider AND h.connection_id = q.connection_id AND h.window_key = q.window_key
+               AND h.next_reset_at = q.next_reset_at AND datetime(h.created_at) < datetime(q.created_at, '-30 minutes')
+               AND datetime(h.created_at) >= datetime(q.created_at, '-5 hours')
+             ORDER BY h.created_at ASC LIMIT 1),
+            (SELECT h.remaining_percentage FROM quota_snapshots h
+             WHERE h.provider = q.provider AND h.connection_id = q.connection_id AND h.window_key = q.window_key
+               AND h.next_reset_at = q.next_reset_at AND datetime(h.created_at) <= datetime(q.created_at, '-1 day')
+               AND datetime(h.created_at) >= datetime(q.created_at, '-7 days')
+             ORDER BY h.created_at ASC LIMIT 1),
+            (SELECT h.created_at FROM quota_snapshots h
+             WHERE h.provider = q.provider AND h.connection_id = q.connection_id AND h.window_key = q.window_key
+               AND h.next_reset_at = q.next_reset_at AND datetime(h.created_at) <= datetime(q.created_at, '-1 day')
+               AND datetime(h.created_at) >= datetime(q.created_at, '-7 days')
+             ORDER BY h.created_at ASC LIMIT 1)
         FROM provider_connections AS p
         LEFT JOIN (
             SELECT provider, connection_id, window_key, MAX(id) AS latest_id
@@ -70,7 +91,6 @@ struct OmniRouteReader: Sendable {
         ) AS latest
             ON latest.provider = p.provider AND latest.connection_id = p.id
         LEFT JOIN quota_snapshots AS q ON q.id = latest.latest_id
-        WHERE COALESCE(p.is_active, 1) != 0 OR lower(p.provider) = 'codex'
         ORDER BY p.provider COLLATE NOCASE, account_name COLLATE NOCASE, q.window_key COLLATE NOCASE
         """
 
@@ -90,7 +110,8 @@ struct OmniRouteReader: Sendable {
                 connectionID: connectionID,
                 displayName: stringColumn(statement, 2) ?? "Account",
                 isActive: sqlite3_column_int(statement, 3) != 0,
-                windows: []
+                windows: [],
+                planName: stringColumn(statement, 11)
             )
 
             if let key = stringColumn(statement, 4) {
@@ -108,8 +129,12 @@ struct OmniRouteReader: Sendable {
                     resetsAt: parseQuotaDate(stringColumn(statement, 7)),
                     durationMilliseconds: duration,
                     capturedAt: parseQuotaDate(stringColumn(statement, 9)),
-                    snapshotID: sqlite3_column_type(statement, 11) == SQLITE_NULL
-                        ? nil : sqlite3_column_int64(statement, 11)
+                    snapshotID: sqlite3_column_type(statement, 10) == SQLITE_NULL
+                        ? nil : sqlite3_column_int64(statement, 10),
+                    priorRemaining: sqlite3_column_type(statement, 12) == SQLITE_NULL ? nil : sqlite3_column_double(statement, 12),
+                    priorCapturedAt: parseQuotaDate(stringColumn(statement, 13)),
+                    weekPriorRemaining: sqlite3_column_type(statement, 14) == SQLITE_NULL ? nil : sqlite3_column_double(statement, 14),
+                    weekPriorCapturedAt: parseQuotaDate(stringColumn(statement, 15))
                 ))
             }
             records[accountKey] = account
@@ -117,6 +142,19 @@ struct OmniRouteReader: Sendable {
 
         if sqlite3_errcode(database) != SQLITE_OK && sqlite3_errcode(database) != SQLITE_DONE {
             throw OmniRouteReadError.query(database.flatMap { sqlite3_errmsg($0) }.map(String.init(cString:)) ?? "query failed")
+        }
+        // OmniRoute changed the label for some primary Codex windows. Snapshots
+        // with the same account and reset are the same window, so keep the most
+        // recently captured reading instead of counting both in the pool.
+        for key in Array(records.keys) {
+            guard var account = records[key], account.provider.caseInsensitiveCompare("codex") == .orderedSame,
+                  let primary = account.windows.first(where: { $0.key == "unknown_primary" }),
+                  let session = account.windows.first(where: { $0.key == "session" }),
+                  let reset = primary.resetsAt, let sessionReset = session.resetsAt,
+                  abs(reset.timeIntervalSince(sessionReset)) < 1 else { continue }
+            let discard = (primary.capturedAt ?? .distantPast) >= (session.capturedAt ?? .distantPast) ? "session" : "unknown_primary"
+            account.windows.removeAll { $0.key == discard }
+            records[key] = account
         }
         return OmniRouteReadResult(
             accounts: records.values.sorted {

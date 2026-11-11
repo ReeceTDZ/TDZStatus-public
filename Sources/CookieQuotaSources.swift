@@ -20,6 +20,7 @@ enum CookieQuotaValueMode: String, Codable, CaseIterable, Identifiable {
 enum CookieQuotaResponseFormat: String, Codable, CaseIterable, Identifiable {
     case json
     case codeCraftPlanHTML
+    case agentRouter
 
     var id: String { rawValue }
 
@@ -27,6 +28,7 @@ enum CookieQuotaResponseFormat: String, Codable, CaseIterable, Identifiable {
         switch self {
         case .json: "JSON endpoint"
         case .codeCraftPlanHTML: "CodeCraft plan page"
+        case .agentRouter: "AgentRouter wallet"
         }
     }
 }
@@ -48,6 +50,7 @@ struct CookieQuotaSource: Codable, Identifiable, Hashable {
     var limitField: String? = nil
     /// Nil means JSON so cookie sources saved by earlier releases keep working.
     var responseFormat: CookieQuotaResponseFormat? = nil
+    var dashboardUserID: String? = nil
     var updatedAt: Date
 
     var effectiveValueMode: CookieQuotaValueMode {
@@ -63,6 +66,7 @@ enum CookieQuotaError: LocalizedError {
     case httpStatus(Int)
     case invalidJSON
     case invalidCookieHeader
+    case monitoringRemoved
     case missingXKiroCookies
     case missingField(String)
     case invalidNumber(String)
@@ -75,6 +79,7 @@ enum CookieQuotaError: LocalizedError {
         case .httpStatus(let code): "The usage endpoint returned HTTP \(code). Check the endpoint and cookie."
         case .invalidJSON: "The endpoint did not return a JSON object."
         case .invalidCookieHeader: "Paste a Cookie-Editor header in name=value; name=value format."
+        case .monitoringRemoved: "TDZStatus no longer monitors CodeCraft or xKiro/Kiro accounts."
         case .missingXKiroCookies: "The xKiro header must include __xt_at and __xt_rt cookies."
         case .missingField(let path): "The response did not contain the configured field ‘\(path)’."
         case .invalidNumber(let path): "The field ‘\(path)’ is not a number."
@@ -85,7 +90,7 @@ enum CookieQuotaError: LocalizedError {
 
 final class CookieQuotaSourceStore {
     private let defaultsKey = "cookieQuotaSources"
-    private let service = "com.reecedove.tdzstatus.provider-cookie"
+    private let service = "com.reecedove.tdzstatus.public.provider-cookie"
     private let sharedAccount = "provider-cookies-v1"
     private var sharedCookies: [String: String]?
 
@@ -232,8 +237,11 @@ final class CookieQuotaFetcher {
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 18)
         request.httpMethod = "GET"
         request.setValue(cleaned, forHTTPHeaderField: "Cookie")
-        request.setValue(source.effectiveResponseFormat == .json ? "application/json" : "text/html,application/xhtml+xml", forHTTPHeaderField: "Accept")
+        request.setValue(source.effectiveResponseFormat == .codeCraftPlanHTML ? "text/html,application/xhtml+xml" : "application/json", forHTTPHeaderField: "Accept")
         request.setValue("TDZStatus/0.1.0", forHTTPHeaderField: "User-Agent")
+        if source.effectiveResponseFormat == .agentRouter, let userID = source.dashboardUserID {
+            request.setValue(userID, forHTTPHeaderField: "New-Api-User")
+        }
 
         session.dataTask(with: request) { data, response, error in
             if let error {
@@ -253,12 +261,14 @@ final class CookieQuotaFetcher {
                     connectionID: source.connectionID,
                     accountName: source.accountName,
                     key: source.windowKey,
-                    remainingPercentage: min(100, max(0, result.remaining)),
+                    remainingPercentage: result.balanceUSD == nil ? min(100, max(0, result.remaining)) : nil,
                     isExhausted: result.remaining <= 0,
                     resetsAt: result.resetDate,
                     durationMilliseconds: result.duration.map { Int64($0 * 60_000) },
                     resetIsEstimated: result.resetIsEstimated,
-                    capturedAt: Date()
+                    capturedAt: Date(),
+                    balanceUSD: result.balanceUSD,
+                    consumedUSD: result.consumedUSD
                 )
                 completion(.success(window))
             } catch {
@@ -272,10 +282,19 @@ final class CookieQuotaFetcher {
         var resetDate: Date?
         var duration: Double?
         var resetIsEstimated: Bool
+        var balanceUSD: Double? = nil
+        var consumedUSD: Double? = nil
     }
 
     private func parseQuota(data: Data, source: CookieQuotaSource) throws -> ParsedQuota {
         switch source.effectiveResponseFormat {
+        case .agentRouter:
+            guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  object["success"] as? Bool == true else { throw CookieQuotaError.invalidJSON }
+            let balance = try number(at: "data.quota", in: object) / 500_000
+            let used = try number(at: "data.used_quota", in: object) / 500_000
+            let total = balance + used
+            return ParsedQuota(remaining: total > 0 ? balance * 100 / total : 0, resetDate: nil, duration: nil, resetIsEstimated: false, balanceUSD: balance, consumedUSD: used)
         case .json:
             guard let object = try? JSONSerialization.jsonObject(with: data) else {
                 throw CookieQuotaError.invalidJSON

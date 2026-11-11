@@ -103,9 +103,14 @@ final class TDZStatusApp: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         if activity == .idle {
             let image = idleImages[harness] ?? fallbackImage(for: harness)
-            image.isTemplate = true
+            // The Codex SVG is a fixed mint outline. Keep its color so macOS
+            // doesn't turn it into a dark template glyph in dark appearance.
+            let hasColoredCodexAsset = harness == .codex && idleImages[harness] != nil
+            image.isTemplate = harness != .codex || !hasColoredCodexAsset
             button.image = image
-            button.contentTintColor = NSColor(calibratedRed: 0.27, green: 0.70, blue: 0.48, alpha: 1)
+            button.contentTintColor = harness == .claude ? nil : harness == .codex
+                ? NSColor(srgbRed: 0.30, green: 0.78, blue: 0.53, alpha: 1)
+                : NSColor(calibratedRed: 0.27, green: 0.70, blue: 0.48, alpha: 1)
             currentKey = key
             return
         }
@@ -113,9 +118,9 @@ final class TDZStatusApp: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard let gif = animations[harness]?[activity], !gif.images.isEmpty else {
             let image = NSImage(systemSymbolName: harness.symbol, accessibilityDescription: "\(harness.title) is \(activity.title.lowercased())")
                 ?? NSImage(systemSymbolName: "sparkles", accessibilityDescription: "TDZStatus")!
-            image.isTemplate = false
+            image.isTemplate = true
             button.image = image
-            button.contentTintColor = color
+            button.contentTintColor = harness.accent
             return
         }
 
@@ -130,8 +135,8 @@ final class TDZStatusApp: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             currentFrameStartedAt = Date()
         }
         button.image = gif.images[currentFrameIndex]
-        button.image?.isTemplate = false
-        button.contentTintColor = color
+        button.image?.isTemplate = harness == .codex || harness == .claude
+        button.contentTintColor = harness == .claude ? nil : color
     }
 
     private func loadAssets() {
@@ -165,10 +170,12 @@ final class TDZStatusApp: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             if let thinkingURL = assetURL(folder: folder, file: thinkingName),
                let frames = decodeGIF(at: thinkingURL) {
+                if harness == .codex { frames.images.forEach { $0.isTemplate = true } }
                 animations[harness, default: [:]][.thinking] = frames
             }
             if let workingURL = assetURL(folder: folder, file: workingName),
                let frames = decodeGIF(at: workingURL) {
+                if harness == .codex { frames.images.forEach { $0.isTemplate = true } }
                 animations[harness, default: [:]][.working] = frames
             }
         }
